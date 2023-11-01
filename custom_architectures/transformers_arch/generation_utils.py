@@ -75,7 +75,9 @@ def get_shape_invariant(model,
     if use_cache:
         state_shapes    = {
             k : _nested_map(v) for k, v in out_shapes.state.items()
-        }
+        } if isinstance(out_shapes.state, dict) else [
+            tf.TensorSpec(shape = s, dtype = dtype) for s in out_shapes.state
+        ]
     
     return TransformerInferenceState(
         t               = tf.TensorSpec(shape = (),                 dtype = tf.int32),

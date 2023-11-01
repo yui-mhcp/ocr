@@ -22,16 +22,19 @@ class CRNN(BaseOCR):
             lang = pretrained_lang
             pretrained, infos = get_easyocr_crnn_infos(model = pretrained, lang = lang)
             
+            vocab   = ['<blank>'] + list(infos['characters'])
+            
             kwargs.update({
                 'pretrained'    : pretrained,
-                'pretrained_name'   : 'easyocr_{}'.format(pretrained)
+                'pretrained_name'   : 'easyocr_{}'.format(pretrained),
+                'original_vocab'    : vocab
             })
             kwargs.setdefault('input_size', (64, None, 1))
             kwargs.setdefault('image_normalization', 'easyocr')
             kwargs.setdefault('text_encoder', {})
             if isinstance(kwargs['text_encoder'], dict) and 'vocab' not in kwargs['text_encoder']:
                 kwargs['text_encoder'].update({
-                    'vocab' : ['<blank>'] + list(infos['characters']),
+                    'vocab' : vocab,
                     'level' : 'char',
                     'pad_token' : '<blank>'
                 })
@@ -46,21 +49,27 @@ class CRNN(BaseOCR):
         
         super().__init__(lang, * args, ** kwargs)
         
-    def _build_model(self, ** kwargs):
-        return super(BaseOCR, self)._build_model(model = {
-            'architecture_name' : 'CRNN',
+    def _build_model(self, original_vocab = None, architecture = 'CRNN', ** kwargs):
+        super(BaseOCR, self)._build_model(model = {
+            'architecture_name' : architecture,
             'input_shape'   : self.input_size,
             'output_dim'    : self.vocab_size,
+            'vocab_size'    : self.vocab_size,
             ** kwargs
         })
-    
-    def decode_output(self, output, ** kwargs):
-        return self.text_encoder.ctc_decode(output, ** kwargs)
-    
-    def compile(self, loss = 'CTCLoss', metrics = ['TextMetric'], ** kwargs):
-        kwargs.setdefault('loss_config', {}).update({'pad_value' : self.blank_token_idx})
-        kwargs.setdefault('metrics_config', {}).update({'pad_value' : self.blank_token_idx})
         
-        super().compile(
-            loss = loss, metrics = metrics, ** kwargs
-        )
+        #if hasattr(self.model, 'change_vocabulary') and original_vocab:
+        #    self.model.change_vocabulary(self.vocab, old_vocab = original_vocab)
+    
+    def compile(self, loss = None, metrics = None, ** kwargs):
+        kwargs.setdefault('loss_config', {}).update({
+            'pad_value' : self.blank_token_idx, 'from_logits' : True
+        })
+        kwargs.setdefault('metrics_config', {}).update({
+            'pad_value' : self.blank_token_idx, 'from_logits' : True
+        })
+        
+        if not loss: loss = 'CTCLoss' if not self.is_encoder_decoder else 'TextLoss'
+        if not metrics: metrics = ['TextMetric'] if not self.is_encoder_decoder else ['TextAccuracy']
+        
+        return super().compile(loss = loss, metrics = metrics, ** kwargs)

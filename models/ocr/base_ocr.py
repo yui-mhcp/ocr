@@ -18,9 +18,9 @@ import pandas as pd
 import tensorflow as tf
 
 from loggers import timer
-from utils import plot, load_json, dump_json, pad_batch
+from utils import plot, load_json, dump_json, get_filename, should_predict, pad_batch
 from utils.image import save_image, load_image, plot
-from utils.image.box_utils import BoxFormat, convert_box_format, combine_boxes, draw_boxes
+from utils.image.box_utils import BoxFormat, convert_box_format, combine_boxes, draw_boxes, combine_box_filters
 from models.interfaces.base_text_model import BaseTextModel
 from models.interfaces.base_image_model import BaseImageModel
 
@@ -36,6 +36,7 @@ class BaseOCR(BaseImageModel, BaseTextModel):
     get_output  = BaseTextModel.tf_encode_text
     augment_input   = BaseImageModel.augment_image
     preprocess_input    = BaseImageModel.preprocess_image
+    augment_original_data   = BaseImageModel.augment_box
     
     def __init__(self,
                  lang   = 'multi',
@@ -62,8 +63,7 @@ class BaseOCR(BaseImageModel, BaseTextModel):
     
     @property
     def default_image_augmentation(self):
-        augment_methods = ['random_rotate']
-        if self.has_variable_input_size: augment_methods += ['random_resize']
+        augment_methods = [] if self.has_fixed_input_size else ['random_resize']
         return super().default_image_augmentation + augment_methods
 
     @property
@@ -86,9 +86,16 @@ class BaseOCR(BaseImageModel, BaseTextModel):
             return self.model.infer(* args, ** kwargs)
         return self(* args, ** kwargs)
     
+    def decode_output(self, output, ** kwargs):
+        if self.is_encoder_decoder:
+            return self.decode_text(
+                output.tokens if hasattr(output, 'tokens') else output, ** kwargs
+            )
+        return self.text_encoder.ctc_decode(output, ** kwargs)
+
     def encode_data(self, data):
         image   = self.get_input(data)
-        tokens  = self.get_output(data, default_key = 'label')
+        tokens  = self.get_output(data, key = 'label')
 
         if self.is_encoder_decoder:
             return (image, tokens[:-1]), tokens[1:]
@@ -96,7 +103,7 @@ class BaseOCR(BaseImageModel, BaseTextModel):
     
     def filter_input(self, inputs):
         image = inputs[0] if self.is_encoder_decoder else inputs
-        return tf.reduce_all(tf.shape(image) > 0)
+        return self.filter_image(image)
     
     def filter_output(self, output):
         return tf.logical_and(
@@ -151,7 +158,9 @@ class BaseOCR(BaseImageModel, BaseTextModel):
                 combine     = True,
                 box_filter  = None,
                 combine_threshold = 0.0125,
+                combine_config  = {},
                 threshold   = 0.,
+                dezoom_factor   = 1.,
                 
                 display = None,
                 box_processing  = None,
@@ -229,51 +238,11 @@ class BaseOCR(BaseImageModel, BaseTextModel):
         # helping function #
         ####################
         
-        @timer
-        def post_process(idx):
-            while idx < len(results) and results[idx] is not None:
-                file, infos = results[idx]
-                
-                if display:
-                    image = load_image(file).numpy()
-                    plot(draw_boxes(image.copy(), infos['boxes'], show_text = False))
-                    for box_infos in infos['ocr']:
-                        logger.info('Text (score {}) : {}'.format(
-                            np.around(box_infos['scores'], decimals = 3), box_infos['text']
-                        ))
-                        plot(load_image(
-                            image, bbox = box_infos['box'], box_mode = BoxFormat.CORNERS
-                        ))
-                
-                if post_processing is not None:
-                    post_processing(infos, image = file)
-                
-                idx += 1
-            
-            return idx
-        
         def save_raw_image(image):
             os.makedirs(raw_img_dir, exist_ok = True)
             filename = os.path.join(raw_img_dir, 'image_{}.png'.format(len(os.listdir(raw_img_dir))))
             save_image(image = image, filename = filename)
             return filename
-        
-        def should_predict(image):
-            if isinstance(image, (dict, pd.Series)) and 'filename' in image: image = image['filename']
-            if isinstance(image, str) and image in predicted:
-                if not overwrite or (timestamp != -1 and timestamp <= predicted[image].get('timestamp', -1)):
-                    return False
-            return True
-        
-        def get_filename(image):
-            if isinstance(image, (dict, pd.Series)):
-                image = image['filename' if 'filename' in image else 'image']
-            if isinstance(image, (np.ndarray, tf.Tensor)):
-                if not save_raw_image or len(image.shape) != 3: return None
-                image = save_raw_image(image)
-            elif not isinstance(image, str):
-                raise ValueError('Unknown image type ({}) : {}'.format(type(image), image))
-            return image.replace(os.path.sep, '/')
         
         now = time.time()
         
@@ -288,6 +257,7 @@ class BaseOCR(BaseImageModel, BaseTextModel):
             images = [detect[-1] for detect in detected]
 
         if display is None: display = not save
+        if box_filter is not None: box_filter = combine_box_filters(box_filter)
         
         if isinstance(images, pd.DataFrame): images = images.to_dict('records')
         if not isinstance(images, (list, tuple, np.ndarray, tf.Tensor)): images = [images]
@@ -310,38 +280,40 @@ class BaseOCR(BaseImageModel, BaseTextModel):
         
         results     = [None] * len(images)
         duplicatas  = {}
-        requested   = [(get_filename(img), img) for img in images]
+        requested   = [(get_filename(img, keys = ('filename', 'image')), img) for img in images]
         
         inputs  = []
         for i, (file, img) in enumerate(requested):
-            if not should_predict(file):
+            if not should_predict(predicted, file, overwrite = overwrite, timestamp = timestamp, required_keys = ['ocr']):
                 results[i] = (file, predicted[file])
-            else:
-                if isinstance(file, str):
-                    duplicatas.setdefault(file, []).append(i)
-                    if len(duplicatas[file]) > 1: continue
-                
-                inputs.append((i, file, img))
+                continue
+
+            if isinstance(file, str):
+                duplicatas.setdefault(file, []).append(i)
+                if len(duplicatas[file]) > 1: continue
+            
+            inputs.append((i, file, img))
         
         ####################
         #  Inference loop  #
         ####################
         
-        show_idx = post_process(0)
+        show_idx = post_process(results, 0, display, post_processing)
         
         if len(inputs) > 0:
             for idx, file, data in inputs:
                 infos = data.copy() if isinstance(data, dict) else {}
                 infos['timestamp'] = now
                 
-                image = load_image(file)
-                if 'boxes' in data:
+                image = load_image(file if file is not None else data['image'])
+                if 'boxes' in infos:
                     if combine:
                         boxes, indices, rows = combine_boxes(
                             data['boxes'],
                             image = image,
                             box_mode = data.get('box_mode', BoxFormat.DEFAULT),
-                            threshold = combine_threshold
+                            threshold = combine_threshold,
+                            ** combine_config
                         )
                     else:
                         boxes = convert_box_format(
@@ -357,41 +329,57 @@ class BaseOCR(BaseImageModel, BaseTextModel):
                     
                     for i, rows_i in enumerate(rows):
                         time_logger.start_timer('OCR')
-                        outputs = []
+                        
+                        outputs, scores = [], []
                         for row in rows_i:
-                            inp = self.get_input(image, bbox = row, box_mode = BoxFormat.CORNERS)
+                            inp = self.get_input(
+                                image, bbox = row, box_mode = BoxFormat.CORNERS, dezoom_factor = dezoom_factor
+                            )
 
                             inp = self.preprocess_input(tf.expand_dims(inp, axis = 0))
-                            out = self.infer(inp)[0]
-                            outputs.append(out)
+                            out = self.infer(inp, ** kwargs)
+                            
+                            if self.is_encoder_decoder:
+                                scores.append(np.squeeze(out.scores) / out.tokens.shape[-1])
+                                out = self.decode_output(out)
+                                if isinstance(out[0], list): out = out[0]
+                            outputs.append(out[0])
 
-                        lengths = tf.cast([len(out) for out in outputs], tf.int32)
-                        outputs = pad_batch(outputs, pad_value = 0., dtype = np.float32)
+                        if not self.is_encoder_decoder:
+                            lengths = tf.cast([len(out) for out in outputs], tf.int32)
+                            outputs = pad_batch(outputs, pad_value = 0., dtype = np.float32)
 
-                        time_logger.start_timer('CTC Beam search')
-                        texts, scores = self.decode_output(outputs, lengths = lengths, method = 'beam', return_scores = True)
-                        time_logger.stop_timer('CTC Beam search')
-
+                            time_logger.start_timer('CTC Beam search')
+                            texts, scores = self.decode_output(
+                                outputs, lengths = lengths, method = 'beam', return_scores = True
+                            )
+                            time_logger.stop_timer('CTC Beam search')
+                        else:
+                            texts   = outputs
+                        
                         time_logger.stop_timer('OCR')
                         
                         if threshold < 0. and np.any(scores < threshold):
                             continue
                         
                         box_infos = {
-                            'box' : boxes[i], 'box_mode' : BoxFormat.CORNERS, 'rows' : rows_i, 'text' : '\n'.join(texts), 'scores' : scores
+                            'box' : boxes[i],
+                            'rows'  : rows_i,
+                            'text'  : ' \n'.join(texts),
+                            'box_mode'  : BoxFormat.CORNERS,
+                            'scores'    : scores
                         }
                         infos.setdefault('ocr', []).append(box_infos)
                         
                         if box_processing is not None:
                             box_processing(box_infos, image = image)
                 else:
-                    raise NotImplementedError()
+                    raise NotImplementedError('Currently, only data with `boxes` key are supported !')
                 
                 if file is None: file = data
                 
                 if isinstance(file, str):
                     infos['filename']   = file
-                    should_save     = True
                     predicted[file] = infos
                     
                     for duplicate_idx in duplicatas[file]:
@@ -400,10 +388,10 @@ class BaseOCR(BaseImageModel, BaseTextModel):
                     if save:
                         dump_json(map_file, predicted, indent = 4)
                 else:
-                    results[idx] = (file if file else img, infos)
+                    results[idx] = (file if file is not None else img, infos)
                 
-                show_idx = post_process(show_idx)
-        
+                show_idx = post_process(results, show_idx, display, post_processing)
+
         return results
 
     def get_config(self, * args, ** kwargs):
@@ -414,3 +402,26 @@ class BaseOCR(BaseImageModel, BaseTextModel):
             'max_output_length' : self.max_output_length
         })
         return config
+
+@timer
+def post_process(results, idx, display, post_processing):
+    while idx < len(results) and results[idx] is not None:
+        file, infos = results[idx]
+        
+        if display:
+            image = load_image(file).numpy()
+            plot(draw_boxes(image.copy(), infos['boxes'], show_text = False))
+            for box_infos in infos['ocr']:
+                logger.info('Text (score {}) : {}'.format(
+                    np.around(box_infos['scores'], decimals = 3), box_infos['text']
+                ))
+                plot(load_image(
+                    image, bbox = box_infos['box'], box_mode = BoxFormat.CORNERS
+                ))
+            
+        if post_processing is not None:
+            post_processing(infos, image = file)
+        
+        idx += 1
+        
+    return idx

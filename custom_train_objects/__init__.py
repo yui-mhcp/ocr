@@ -12,7 +12,7 @@
 
 import tensorflow as tf
 
-from utils.generic_utils import get_object, print_objects
+from utils import get_object, print_objects
 
 from custom_train_objects.history import History
 
@@ -26,41 +26,40 @@ from custom_train_objects.optimizers import _optimizers, _schedulers
 def get_callbacks(callback_name = None, * args, ** kwargs):
     return get_object(
         _callbacks, callback_name, * args, ** kwargs, print_name = 'callbacks',
-        allowed_type = tf.keras.callbacks.Callback
+        types = tf.keras.callbacks.Callback
     )
 
 def get_loss(loss_name, * args, ** kwargs):
     return get_object(
-        _losses, loss_name, * args, ** kwargs, print_name = 'loss', allowed_type = tf.keras.losses.Loss
+        _losses, loss_name, * args, ** kwargs, print_name = 'loss', types = tf.keras.losses.Loss
     )
 
 def get_metrics(metrics_name, * args, ** kwargs):
     if isinstance(metrics_name, (list, tuple)):
         return [get_metrics(m, * args, ** kwargs) for m in metrics_name]
     if isinstance(metrics_name, dict):
-        kwargs = {** kwargs, ** metrics_name.get('config', {})}
+        config_key = 'metric_config' if 'metric_config' in metrics_name else 'config'
+        kwargs = {** kwargs, ** metrics_name.get(config_key, {})}
         metrics_name = metrics_name.get('metric', metrics_name)
+    
     return get_object(
         _metrics, metrics_name, * args, ** kwargs, print_name = 'metric',
-        allowed_type = tf.keras.metrics.Metric
+        types = tf.keras.metrics.Metric
     )
 
 def get_optimizer(optimizer_name = "adam", * args, ** kwargs):
     lr = kwargs.pop('lr', None)
     if lr is None: lr = kwargs.get('learning_rate', None)
-    
     if lr is not None:
         if isinstance(lr, (dict, str)):
             if isinstance(lr, str): lr = {'name' : lr}
-            if 'class_name' in lr:
-                lr = {** lr['config'], 'name' : lr['class_name']}
+            if 'class_name' in lr:  lr = {** lr['config'], 'name' : lr['class_name']}
             lr = get_object(_schedulers, lr.pop('name'), ** lr, print_name = 'lr scheduler')
-        
         kwargs['learning_rate'] = lr
     
     return get_object(
-        _optimizers, optimizer_name, * args, ** kwargs, print_name = 'optimizer',
-        allowed_type = tf.keras.optimizers.Optimizer
+        _optimizers, optimizer_name, * args, ** kwargs, print_name = 'optimizer', 
+        types = tf.keras.optimizers.Optimizer
     )
 
 
@@ -75,3 +74,4 @@ def print_metrics():
 
 def print_optimizers():
     print_objects(_optimizers, 'optimizers')
+

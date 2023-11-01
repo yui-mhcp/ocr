@@ -13,6 +13,7 @@
 import numpy as np
 import tensorflow as tf
 
+from loggers import timer
 from utils.image.box_utils.geo_utils import *
 from models.detection.base_detector import BaseDetector
 
@@ -64,6 +65,7 @@ class EAST(BaseDetector):
     def compile(self, loss = 'EASTLoss', ** kwargs):
         super().compile(loss = loss, ** kwargs)
 
+    @timer
     def decode_output(self, model_output, nms_method = 'lanms', normalize = True, ** kwargs):
         kwargs.setdefault('threshold',      self.obj_threshold)
         kwargs.setdefault('nms_threshold',  self.nms_threshold)

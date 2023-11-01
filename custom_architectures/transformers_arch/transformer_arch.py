@@ -204,7 +204,8 @@ def build_mask(inputs,
     return combine_masks(padding_mask, look_ahead_mask)
 
 class FeedForwardNetwork(tf.keras.Model):
-    def __init__(self, ffn_dim, ffn_activation, embedding_dim, name = 'ffn'):
+    def __init__(self, ffn_dim, ffn_activation, embedding_dim, use_bias = True,
+                 use_up_proj = False, name = 'ffn'):
         """
             Simple 2-`Dense` sequential network with an activation function between the 2 layers.
             
@@ -216,22 +217,28 @@ class FeedForwardNetwork(tf.keras.Model):
         super().__init__(name = name)
         
         self.ffn_dim    = ffn_dim
+        self.use_bias   = use_bias
+        self.use_up_proj    = use_up_proj
         self.ffn_activation = ffn_activation
         self.embedding_dim  = embedding_dim
         
-        self.dense_1    = tf.keras.layers.Dense(ffn_dim, name = 'dense_1')
+        self.dense_1    = tf.keras.layers.Dense(ffn_dim, use_bias = use_bias, name = 'dense_1')
+        self.up_proj    = tf.keras.layers.Dense(ffn_dim, use_bias = use_bias, name = 'up_proj') if use_up_proj else None
         self.act        = get_activation(ffn_activation)
-        self.dense_2    = tf.keras.layers.Dense(embedding_dim, name = 'dense_2')
+        self.dense_2    = tf.keras.layers.Dense(embedding_dim, use_bias = use_bias, name = 'dense_2')
     
     def call(self, inputs, training = False):
         x = self.dense_1(inputs)
         if self.act is not None: x = self.act(x)
+        if self.use_up_proj:     x = x * self.up_proj(inputs)
         return self.dense_2(x)
 
     def get_config(self):
         return {
             'name'  : self.name,
             'ffn_dim'   : self.ffn_dim,
+            'use_bias'  : self.use_bias,
+            'use_up_proj'   : self.use_up_proj,
             'ffn_activation'    : self.ffn_activation,
             'embedding_dim' : self.embedding_dim
         }

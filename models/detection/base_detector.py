@@ -22,7 +22,7 @@ from loggers import timer
 from utils.thread_utils import Consumer
 from custom_architectures import get_architecture
 from models.interfaces.base_image_model import BaseImageModel
-from utils import load_json, dump_json, normalize_filename, plot, pad_batch
+from utils import load_json, dump_json, normalize_filename, should_predict, get_filename, plot, pad_batch
 from utils.image import _video_formats, _image_formats, load_image, save_image, stream_camera, BASE_COLORS, get_video_infos
 from utils.image.box_utils import *
 
@@ -71,14 +71,6 @@ class BaseDetector(BaseImageModel):
         return os.path.join(self.folder, "stream")
     
     @property
-    def grid_h(self):
-        return self.output_shape[1]
-    
-    @property
-    def grid_w(self):
-        return self.output_shape[2]
-    
-    @property
     def use_labels(self):
         return False if self.nb_class == 1 else True
 
@@ -93,7 +85,7 @@ class BaseDetector(BaseImageModel):
         return des
 
     @timer(name = 'inference', log_if_root = False)
-    def detect(self, image, get_boxes = False, training = False, ** kwargs):
+    def detect(self, image, get_boxes = False, training = False, return_output = False, ** kwargs):
         """
             Performs prediction on `image` and returns either the model's output either the boxes (if `get_boxes = True`)
             
@@ -116,7 +108,8 @@ class BaseDetector(BaseImageModel):
         
         if not get_boxes: return outputs
         
-        return self.decode_output(outputs, ** kwargs)
+        boxes = self.decode_output(outputs, ** kwargs)
+        return boxes if not return_output else zip(outputs, boxes)
     
     def encode_data(self, data):
         return self.get_input(data), self.get_output(data)
@@ -141,6 +134,19 @@ class BaseDetector(BaseImageModel):
 
         return draw_boxes(image, boxes, ** kwargs)
     
+    @timer
+    def show_result(self, image, detected, boxes, verbose = 1, ** kwargs):
+        if not verbose: return
+        if verbose > 1:
+            if verbose == 3:
+                logger.info("{} boxes found :\n{}".format(
+                    len(boxes), '\n'.join(str(b) for b in boxes)
+                ))
+
+            show_boxes(image, boxes, labels = kwargs.pop('labels', self.labels), ** kwargs)
+        # Show original image with drawed boxes
+        plot(detected, title = '{} object(s) detected'.format(len(boxes)), ** kwargs)
+
     @timer
     def save_image(self, image, directory = None, filename = 'image_{}.jpg', ** kwargs):
         """ Saves `image` to `directory` (default `{self.pred_dir}/images/`) and returns its path """
@@ -189,7 +195,7 @@ class BaseDetector(BaseImageModel):
             image_h, image_w = get_image_size(image)
             normalized_boxes = [get_box_pos(
                 box, image_h = image_h, image_w = image_w, labels = labels,
-                with_label = True, dezoom_factor = dezoom_factor,
+                extended = True, dezoom_factor = dezoom_factor,
                 normalize_mode = NORMALIZE_WH
             )[:5] for box in boxes]
             
@@ -293,6 +299,7 @@ class BaseDetector(BaseImageModel):
     def predict(self,
                 images,
                 batch_size = 16,
+                return_output   = False,
                 # general saving config
                 directory   = None,
                 overwrite   = False,
@@ -390,65 +397,16 @@ class BaseDetector(BaseImageModel):
             In this case, `kwargs` are forwarded to `self.predict_videos`
         """
         ####################
-        # helping function #
-        ####################
-        
-        time_logger.start_timer('initialization')
-
-        @timer
-        def post_process(idx):
-            while idx < len(results) and results[idx] is not None:
-                image, detected, infos = results[idx]
-                
-                if verbose and idx < display:
-                    if isinstance(detected, str): detected = load_image(detected)
-                    show_result_fn(image, detected = detected, boxes = infos.get('boxes', []))
-                
-                if post_processing is not None:
-                    post_processing(detected, image = file, infos = infos)
-                
-                idx += 1
-
-            return idx
-        
-        @timer
-        def show_result(image, detected, boxes):
-            if verbose > 1:
-                if verbose == 3:
-                    logger.info("{} boxes found :\n{}".format(
-                        len(boxes), '\n'.join(str(b) for b in boxes)
-                    ))
-
-                show_boxes(image, boxes, labels = kwargs.get('labels', self.labels), ** plot_kwargs)
-            # Show original image with drawed boxes
-            plot(detected, title = '{} object(s) detected'.format(len(boxes)), ** plot_kwargs)
-
-        def should_predict(image):
-            if isinstance(image, (dict, pd.Series)) and 'filename' in image:
-                image = image['filename']
-            if isinstance(image, str) and all(k in predicted.get(image, {}) for k in required_keys):
-                if not overwrite or (timestamp != -1 and timestamp <= predicted[image].get('timestamp', -1)):
-                    return False
-            return True
-        
-        def get_filename(image):
-            if isinstance(image, (dict, pd.Series)):
-                return image.get('filename', None)
-            if isinstance(image, (np.ndarray, tf.Tensor)):
-                return None
-            elif isinstance(image, str):
-                return image
-            raise ValueError('Unknown image type ({}) : {}'.format(type(image), image))
-        
-        ####################
         #  Initialization  #
         ####################
+
+        time_logger.start_timer('initialization')
 
         stop_saving_functions = False
         if saving_functions is None:
             stop_saving_functions   = True
             saving_functions    = self._get_saving_functions(
-                max_workers = max_workers, show_result_fn = show_result
+                max_workers = max_workers, show_result_fn = self.show_result
             )
 
         if len(saving_functions) != 5:
@@ -500,57 +458,68 @@ class BaseDetector(BaseImageModel):
         
         results     = [None] * len(images)
         duplicatas  = {}
-        requested   = [(get_filename(img), img) for img in images]
+        requested   = [(get_filename(img, keys = ('filename', )), img) for img in images]
         
-        videos, inputs, encoded = [], [], []
+        videos, inputs = [], []
         for i, (file, img) in enumerate(requested):
-            if not should_predict(file):
+            if not should_predict(predicted, file, overwrite = overwrite, timestamp = timestamp, required_keys = required_keys):
                 results[i] = (file, predicted[file].get('detected', None), predicted[file])
-            else:
-                if isinstance(file, str):
-                    duplicatas.setdefault(file, []).append(i)
-                    
-                    if file.endswith(_video_formats):
-                        videos.append(file)
-                        continue
-                    elif len(duplicatas[file]) > 1:
-                        continue
+                continue
+
+            if isinstance(file, str):
+                duplicatas.setdefault(file, []).append(i)
                 
-                if isinstance(img, dict):
-                    if 'tf_image' in img:
-                        image = img['tf_image']
-                    elif 'image' in img:
-                        image = load_image(img['image' if 'image_copy' not in img else 'image_copy'])
-                    elif 'filename' in img:
-                        image = load_image(img['filename'])
-                else:
-                    image = load_image(img)
-                inputs.append((i, file, img, image))
-                encoded.append(self.get_input(image))
+                if file.endswith(_video_formats):
+                    videos.append(file)
+                    continue
+                elif len(duplicatas[file]) > 1:
+                    continue
+            
+            inputs.append((i, file, img))
         
+        time_logger.stop_timer('pre-processing')
+
         ####################
         #  Inference loop  #
         ####################
         
-        show_idx    = post_process(0)
+        show_idx    = post_process(
+            results, 0, verbose, display, show_result_fn, post_processing, ** plot_kwargs
+        )
         
         if len(inputs) > 0:
-            if not self.has_variable_input_size:
-                encoded = tf.stack(encoded, 0) if len(encoded) > 1 else tf.expand_dims(encoded[0], 0)
-                encoded = self.preprocess_input(encoded)
-            
-            time_logger.stop_timer('pre-processing')
-            
             for start in range(0, len(inputs), batch_size):
-                batch = encoded[start : start + batch_size]
-                if self.has_variable_input_size:
-                    batch = tf.expand_dims(batch[0], 0) if len(batch) == 1 else pad_batch(batch)
-                    batch = self.preprocess_input(batch)
+                time_logger.start_timer('batch processing')
+                
+                batch_inputs    = inputs[start : start + batch_size]
+                batch_images    = [_get_image(file, data) for _, file, data in batch_inputs]
+                
+                batch   = [self.get_input(image) for image in batch_images]
+                if len(batch) == 1:
+                    batch = tf.expand_dims(batch[0], axis = 0)
+                elif self.has_variable_input_size:
+                    batch = tf.cast(pad_batch(batch, dtype = np.float32), tf.float32)
+                else:
+                    batch = tf.stack(batch, axis = 0)
+                
+                batch = self.preprocess_input(batch)
+                
+                time_logger.stop_timer('batch processing')
+
                 # Computes detection + output decoding
-                boxes   = self.detect(batch, get_boxes = True, ** kwargs)
+                boxes   = self.detect(
+                    batch, get_boxes = True, return_output = return_output, ** kwargs
+                )
                 
                 should_save = False
-                for (idx, file, data, image), box in zip(inputs[start : start + batch_size], boxes):
+                for (idx, file, data), image, box in zip(batch_inputs, batch_images, boxes):
+                    output, box = (None, box) if not return_output else box
+                    
+                    infos = data if isinstance(data, dict) else {}
+                    infos = {
+                        k : v for k, v in infos.items()
+                        if 'image' not in k or not isinstance(v, (np.ndarray, tf.Tensor))
+                    }
                     if file is None:
                         if isinstance(data, (np.ndarray, tf.Tensor)):
                             file = data
@@ -560,20 +529,19 @@ class BaseDetector(BaseImageModel):
                             file = image
                     # Maybe skips the image if nothing has been detected
                     if not isinstance(file, str) and not save_empty and len(box) == 0:
-                        results[idx] = (file, file, {})
+                        results[idx] = (file, file, infos)
                         continue
                     
                     time_logger.start_timer('post processing')
 
-                    detected    = None
-                    basename    = None
+                    basename, detected = None, None
                     if save_detected or verbose or post_processing is not None or force_draw:
                         time_logger.start_timer('drawing boxes')
                         
                         if isinstance(data, (dict, pd.Series)) and 'image_copy' in data:
                             detected = data['image_copy']
                         elif isinstance(file, np.ndarray):
-                            detected = image.numpy() if save else file
+                            detected = image.copy() if save else file
                         elif isinstance(file, tf.Tensor):
                             detected = file.numpy()
                         else:
@@ -582,7 +550,7 @@ class BaseDetector(BaseImageModel):
                         detected    = self.draw_prediction(detected, box, ** kwargs)
                         time_logger.stop_timer('drawing boxes')
 
-                    infos   = {'boxes' : box, 'timestamp' : now}
+                    infos.update({'boxes' : box, 'timestamp' : now})
                     if save:
                         time_logger.start_timer('saving frame')
                         # Saves the raw image (i.e. if it is not already a filename)
@@ -603,6 +571,7 @@ class BaseDetector(BaseImageModel):
                         basename    = os.path.splitext(os.path.basename(file))[0]
                         should_save     = True
                         predicted[file] = infos
+                        
                         time_logger.stop_timer('saving frame')
 
                     if isinstance(file, str):
@@ -641,6 +610,9 @@ class BaseDetector(BaseImageModel):
                         }
                         time_logger.stop_timer('saving boxes')
 
+                    # This ensures that the `infos` saved will not be modified by `post_process`
+                    infos = infos.copy()
+                    if return_output: infos['output'] = output
                     # Sets result at the (multiple) index(es)
                     if isinstance(file, str) and file in duplicatas:
                         for duplicate_idx in duplicatas[file]:
@@ -655,9 +627,9 @@ class BaseDetector(BaseImageModel):
                     save_json_fn(map_file, data = predicted.copy(), indent = 4)
                     time_logger.stop_timer('saving json')
                 
-                show_idx = post_process(show_idx)
-        else:
-            time_logger.stop_timer('pre-processing')
+                show_idx    = post_process(
+                    results, show_idx, verbose, display, show_result_fn, post_processing, ** plot_kwargs
+                )
 
         if stop_saving_functions:
             for fn in saving_functions:
@@ -905,3 +877,34 @@ class BaseDetector(BaseImageModel):
         })
         
         return config
+
+def _get_image(file, data):
+    if isinstance(data, dict):
+        if 'tf_image' in data:
+            return data['tf_image']
+        for k in ('image_copy', 'image', 'filename'):
+            if k in data: return load_image(data[k])
+    return load_image(file)
+
+@timer
+def post_process(results, idx, verbose, max_display, show_result_fn, post_processing_fn, ** kwargs):
+    while idx < len(results) and results[idx] is not None:
+        image, detected, infos = results[idx]
+        
+        if verbose and idx < max_display:
+            if isinstance(detected, str): detected = load_image(detected)
+            show_result_fn(
+                image,
+                boxes   = infos.get('boxes', []),
+                detected    = detected,
+                verbose = verbose,
+                ** kwargs
+            )
+        
+        if post_processing_fn is not None:
+            post_processing_fn(detected, image = image, infos = infos)
+        
+        idx += 1
+
+    return idx
+
