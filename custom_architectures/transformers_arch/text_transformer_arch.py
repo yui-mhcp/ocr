@@ -1,5 +1,4 @@
-
-# Copyright (C) 2022 yui-mhcp project's author. All rights reserved.
+# Copyright (C) 2022-now yui-mhcp project's author. All rights reserved.
 # Licenced under the Affero GPL v3 Licence (the "Licence").
 # you may not use this file except in compliance with the License.
 # See the "LICENCE" file at the root of the directory for the licence information.
@@ -15,8 +14,8 @@ import tensorflow as tf
 from loggers import timer
 from hparams import HParams
 from custom_layers import FasterEmbedding
+from custom_architectures.generation_utils import infer as infer_method
 from custom_architectures.transformers_arch.transformer_arch import *
-from custom_architectures.transformers_arch.generation_utils import infer as infer_method
 from custom_architectures.transformers_arch.transformer_arch import _get_state_length
 
 HParamsTransformerTokenEmbedding = HParams(
@@ -99,7 +98,7 @@ class TransformerTokenEmbedding(tf.keras.layers.Layer):
             )
         
         # Set positional embedding layer
-        if positional_embedding is None:
+        if positional_embedding is None and self.max_input_length > 1:
             positional_embedding    = FasterEmbedding(
                 self.max_input_length, self.embedding_dim, name = "pos_embeddings"
             )
@@ -140,7 +139,8 @@ class TransformerTokenEmbedding(tf.keras.layers.Layer):
 
     @timer
     def embed_tokens(self, text):
-        return self.token_embedding_layer(text) * self.embedding_factor
+        embeddings = self.token_embedding_layer(text)
+        return embeddings * tf.cast(self.embedding_factor, embeddings.dtype)
     
     @timer
     def embed_token_types(self, token_types, batch_size, seq_len):
@@ -162,6 +162,7 @@ class TransformerTokenEmbedding(tf.keras.layers.Layer):
                         initial_state   = None,
                         debug = False
                        ):
+        if self.pos_embedding_layer is None: return 0
         if initial_state:
             positional_offset += _get_state_length(initial_state)
         
@@ -215,7 +216,7 @@ class TransformerTokenEmbedding(tf.keras.layers.Layer):
             # Embed tokens (text)
             token_embedded = self.embed_tokens(text)
 
-            if prefix is not None:
+            if prefix is not None and _get_state_length(initial_state) == 0:
                 token_embedded = tf.concat([prefix, token_embedded], axis = 1)
         else:
             token_embedded = prefix
@@ -357,7 +358,7 @@ class TextTransformerBlock(TransformerBlock):
                 mask = tf.concat([
                     tf.ones((tf.shape(text)[0], 1, 1, prefix_length), dtype = mask.dtype), mask
                 ], axis = -1)
-        
+
         embedded = self.embeddings(
             text,
             input_length    = input_length,
@@ -389,11 +390,21 @@ class TextTransformerBlock(TransformerBlock):
 
     def infer(self, * args, ** kwargs):
         kwargs.setdefault('max_length', self.max_input_length)
-        return infer_method(self, * args, ** kwargs)
+        return infer_method(
+            self,
+            * args,
+            
+            sos_token   = self.sos_token,
+            eos_token   = self.eos_token,
+            pad_token   = self.pad_token,
+            vocab_size  = self.vocab_size,
+            
+            ** kwargs
+        )
     
     def transfer_weights(self, * args, ** kwargs):
         kwargs.setdefault('skip_layers', ('sos_token', 'eos_token', 'pad_token'))
-        return super().transfer_weights(* args, ** kwargs)
+        return super(TextTransformerBlock, self).transfer_weights(* args, ** kwargs)
     
     def get_output_shape(self, inputs, * args, ** kwargs):
         return super().get_output_shape(

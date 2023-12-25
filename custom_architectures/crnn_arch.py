@@ -533,7 +533,9 @@ class CRNNWithAttn(tf.keras.Model):
 
     def get_initial_state(self, batch_size = None, dtype = None):
         return CRNNState(
-            attention_state = self.attn_cell.get_initial_state(batch_size = batch_size, dtype = dtype),
+            attention_state = self.attn_cell.get_initial_state(
+                batch_size = batch_size, dtype = dtype
+            ),
             main_attention  = tf.zeros((batch_size, ), dtype = tf.int32)
         )
 
@@ -542,7 +544,10 @@ class CRNNWithAttn(tf.keras.Model):
         return CRNNStep(
             output = (batch_size, self.vocab_size),
             state  = CRNNState(
-                attention_state = [(batch_size, self.attn_cell.hidden_size), (batch_size, self.attn_cell.hidden_size)],
+                attention_state = [
+                    (batch_size, self.attn_cell.hidden_size),
+                    (batch_size, self.attn_cell.hidden_size)
+                ],
                 main_attention  = (batch_size, )
             ),
             attention_weights = (batch_size, encoder_output[1])
@@ -594,21 +599,26 @@ class CRNNWithAttn(tf.keras.Model):
         
         embeddings = self.embedding_layer(inputs)
         
+        encoder_len = tf.shape(encoder_output)[1]
         if attn_mask_win_len > 0:
             center = tf.maximum(attn_mask_offset, initial_state.main_attention)
-            center = tf.minimum(center, tf.shape(encoder_output)[1] - attn_mask_win_len + attn_mask_offset)
+            center = tf.minimum(center, encoder_len - attn_mask_win_len + attn_mask_offset)
             center = tf.expand_dims(center, axis = 1)
             
-            attn_mask   = tf.expand_dims(tf.range(tf.shape(encoder_output)[1]), axis = 0)
+            attn_mask   = tf.expand_dims(tf.range(encoder_len), axis = 0)
             attn_mask   = tf.logical_and(
                 center - attn_mask_offset <= attn_mask,
                 attn_mask <= center + attn_mask_win_len - attn_mask_offset
             )
         else:
-            attn_mask = tf.fill((1, tf.shape(encoder_output)[1]), True)
+            attn_mask = tf.fill((1, encoder_len), True)
 
         state, attn = self.attn_cell(
-            embeddings, encoder_output, initial_state.attention_state, training = training, mask = attn_mask
+            embeddings,
+            encoder_output,
+            initial_state.attention_state,
+            training    = training,
+            mask    = attn_mask
         )
         attn = attn[:, :, 0]
         
@@ -617,6 +627,14 @@ class CRNNWithAttn(tf.keras.Model):
         )
         
         logit   = self.decoder(state[0])
+
+        finish_mask = main_attention > encoder_len
+        if tf.reduce_any(finish_mask):
+            tf.print('Attention :', main_attention, '- length :', encoder_len, '- next token :', tf.argmax(logit, axis = -1))
+            eos_mask    = tf.tensor_scatter_nd_update(
+                tf.fill((1, self.vocab_size), logit.dtype.min), [[0, self.eos_token]], [0.]
+            )
+            logits = tf.where(finish_mask[:, tf.newaxis], eos_mask, logit)
 
         return CRNNStep(
             output = logit,
@@ -642,11 +660,13 @@ class CRNNWithAttn(tf.keras.Model):
             attn_mask_offset  = attn_mask_offset,
             attn_mask_win_len = attn_mask_win_len,
             
-            step_fn    = self.step,
-            sos_token  = self.sos_token,
-            eos_token  = self.eos_token,
-            pad_token  = self.pad_token,
-            vocab_size = self.vocab_size,
+            step_fn     = self.step,
+            sos_token   = self.sos_token,
+            eos_token   = self.eos_token,
+            pad_token   = self.pad_token,
+            vocab_size  = self.vocab_size,
+            
+            use_cache   = True,
             
             ** kwargs
         )

@@ -52,7 +52,9 @@ def get_shape_invariant(model,
                         use_cache   = False,
                         return_attention    = False,
                         return_last_attention   = False,
-                        dtype   = tf.float32
+                        return_only_cross_attention = False,
+                        dtype   = tf.float32,
+                        ** _
                        ):
     def _nested_map(shape):
         if isinstance(shape[0], tuple): return tuple(_nested_map(s) for s in shape)
@@ -64,6 +66,7 @@ def get_shape_invariant(model,
         return_state        = use_cache,
         return_attention    = return_attention,
         return_last_attention   = return_last_attention,
+        return_only_cross_attention = return_only_cross_attention,
         as_dict = True
     )
     if return_attention or return_last_attention:
@@ -132,7 +135,7 @@ def _infer(self,
         return not (early_stopping and tf.reduce_all(finished))
     
     def body(t, tokens, lengths, scores, last_tokens, padding_mask, finished, logits, state, attn):
-        #tf.print('\nIteration #', t, '\nInput tokens :', tokens)
+        #tf.print('tokens at t =', t, ':', tokens)
         outputs = self(
             tokens if not use_cache or t == 0 else last_tokens,
             input_length    = lengths,
@@ -231,7 +234,8 @@ def _infer(self,
         return_attention    = return_attention,
         return_last_attention   = return_last_attention,
         use_cache   = use_cache,
-        dtype   = dtype
+        dtype   = dtype,
+        ** kwargs
     )
     outputs = tf.nest.map_structure(tf.stop_gradient, tf.while_loop(
         cond    = cond,
@@ -307,6 +311,7 @@ def _infer_beam_search(self,
         return not tf.reduce_all(tf.reshape(finished, [batch_size, num_beams])[:, : num_sentences])
     
     def body(t, tokens, lengths, scores, last_tokens, padding_mask, finished, logits, state, attn):
+        #tf.print('tokens at t =', t, ':', tokens)
         outputs = self(
             tokens if not use_cache or t == 0 else last_tokens,
             input_length    = lengths,

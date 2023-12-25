@@ -1,5 +1,4 @@
-
-# Copyright (C) 2022 yui-mhcp project's author. All rights reserved.
+# Copyright (C) 2022-now yui-mhcp project's author. All rights reserved.
 # Licenced under the Affero GPL v3 Licence (the "Licence").
 # you may not use this file except in compliance with the License.
 # See the "LICENCE" file at the root of the directory for the licence information.
@@ -11,21 +10,23 @@
 # limitations under the License.
 
 import os
+import glob
 import time
 import logging
 import numpy as np
 import pandas as pd
 import tensorflow as tf
 
-from loggers import timer
+from loggers import timer, time_logger
 from utils import plot, load_json, dump_json, get_filename, should_predict, pad_batch
-from utils.image import save_image, load_image, plot
-from utils.image.box_utils import BoxFormat, convert_box_format, combine_boxes, draw_boxes, combine_box_filters
+from utils.distance import dice_coeff, edit_distance
+from utils.text import build_masking_filter
+from utils.image import HTTPScreenMirror, save_image, load_image
+from utils.image.box_utils import *
 from models.interfaces.base_text_model import BaseTextModel
 from models.interfaces.base_image_model import BaseImageModel
 
 logger  = logging.getLogger(__name__)
-time_logger = logging.getLogger('timer')
 
 DEFAULT_MAX_TEXT_LENGTH = 32
 
@@ -56,6 +57,10 @@ class BaseOCR(BaseImageModel, BaseTextModel):
         if hasattr(self.model, 'set_tokens'): self.model.set_tokens(** self.model_tokens)
     
     @property
+    def stream_dir(self):
+        return os.path.join(self.folder, "stream")
+
+    @property
     def input_signature(self):
         if self.is_encoder_decoder:
             return (self.image_signature, self.text_signature)
@@ -79,19 +84,18 @@ class BaseOCR(BaseImageModel, BaseTextModel):
         return super().__str__() + self._str_image() + self._str_text()
     
     @timer(name = 'inference')
-    def infer(self, * args, ** kwargs):
+    def infer(self, inputs, training = False, ** kwargs):
         if hasattr(self.model, 'infer'):
             kwargs.setdefault('max_length', self.max_output_length)
         
-            return self.model.infer(* args, ** kwargs)
-        return self(* args, ** kwargs)
+            return self.model.infer(inputs, training = training, ** kwargs)
+        if self.model.__class__.__name__ == 'Functional': kwargs = {}
+        return self(inputs, training = training, ** kwargs)
     
-    def decode_output(self, output, ** kwargs):
+    def decode_output(self, output, remove_tokens = True, ** kwargs):
         if self.is_encoder_decoder:
-            return self.decode_text(
-                output.tokens if hasattr(output, 'tokens') else output, ** kwargs
-            )
-        return self.text_encoder.ctc_decode(output, ** kwargs)
+            return self.decode_text(output, remove_tokens = remove_tokens, ** kwargs)
+        return self.text_encoder.ctc_decode(output, remove_tokens = remove_tokens, ** kwargs)
 
     def encode_data(self, data):
         image   = self.get_input(data)
@@ -102,7 +106,7 @@ class BaseOCR(BaseImageModel, BaseTextModel):
         return image, tokens
     
     def filter_input(self, inputs):
-        image = inputs[0] if self.is_encoder_decoder else inputs
+        image = inputs[0] if isinstance(inputs, (list, tuple)) else inputs
         return self.filter_image(image)
     
     def filter_output(self, output):
@@ -161,6 +165,10 @@ class BaseOCR(BaseImageModel, BaseTextModel):
                 combine_config  = {},
                 threshold   = 0.,
                 dezoom_factor   = 1.,
+                
+                method  = 'beam',
+                num_sentences   = 1,
+                length_power    = 0.25,
                 
                 display = None,
                 box_processing  = None,
@@ -251,9 +259,8 @@ class BaseOCR(BaseImageModel, BaseTextModel):
                 from models import get_pretrained
                 detector = get_pretrained(detector)
             
-            detected = detector.predict(
-                images, save = False, display = False, ** detector_kwargs
-            )
+            for k in ('save', 'display'): detector_kwargs.setdefault(k, False)
+            detected = detector.predict(images, ** detector_kwargs)
             images = [detect[-1] for detect in detected]
 
         if display is None: display = not save
@@ -328,36 +335,50 @@ class BaseOCR(BaseImageModel, BaseTextModel):
                         boxes, rows  = boxes[keep_indexes], [rows[index] for index in keep_indexes]
                     
                     for i, rows_i in enumerate(rows):
-                        time_logger.start_timer('OCR')
-                        
+                        logger.debug('Rows : {}'.format(np.around(rows_i, decimals = 3)))
                         outputs, scores = [], []
-                        for row in rows_i:
-                            inp = self.get_input(
-                                image, bbox = row, box_mode = BoxFormat.CORNERS, dezoom_factor = dezoom_factor
-                            )
+                        with time_logger.timer('OCR'):
+                            for row in rows_i:
+                                inp = self.get_input(
+                                    image, bbox = row, box_mode = BoxFormat.CORNERS, dezoom_factor = dezoom_factor
+                                )
+                                if any(s == 0 for s in inp.shape):
+                                    logger.info('Invalid input encountered : {}'.format(inp.shape))
+                                    continue
+                                
+                                inp = self.preprocess_input(tf.expand_dims(inp, axis = 0))
+                                out = self.infer(
+                                    inp,
+                                    method  = method,
+                                    num_sentences   = num_sentences,
+                                    length_power    = length_power,
+                                    ** kwargs
+                                )
 
-                            inp = self.preprocess_input(tf.expand_dims(inp, axis = 0))
-                            out = self.infer(inp, ** kwargs)
+                                if self.is_encoder_decoder:
+                                    scores.append(np.squeeze(
+                                        out.scores.numpy() / out.lengths.numpy()
+                                    ))
+                                    out = self.decode_output(out)
+                                    if isinstance(out[0], list): out = out[0]
+                                outputs.append(out[0])
+
+                            if not outputs: continue
                             
-                            if self.is_encoder_decoder:
-                                scores.append(np.squeeze(out.scores) / out.tokens.shape[-1])
-                                out = self.decode_output(out)
-                                if isinstance(out[0], list): out = out[0]
-                            outputs.append(out[0])
+                            if not self.is_encoder_decoder:
+                                lengths = tf.cast([len(out) for out in outputs], tf.int32)
+                                outputs = pad_batch(outputs, pad_value = 0., dtype = np.float32)
 
-                        if not self.is_encoder_decoder:
-                            lengths = tf.cast([len(out) for out in outputs], tf.int32)
-                            outputs = pad_batch(outputs, pad_value = 0., dtype = np.float32)
-
-                            time_logger.start_timer('CTC Beam search')
-                            texts, scores = self.decode_output(
-                                outputs, lengths = lengths, method = 'beam', return_scores = True
-                            )
-                            time_logger.stop_timer('CTC Beam search')
-                        else:
-                            texts   = outputs
-                        
-                        time_logger.stop_timer('OCR')
+                                with time_logger.timer('CTC Beam search'):
+                                    texts, scores = self.decode_output(
+                                        outputs,
+                                        lengths = lengths,
+                                        method  = 'beam',
+                                        return_scores   = True
+                                    )
+                            else:
+                                texts   = outputs
+                                scores  = np.array(scores)
                         
                         if threshold < 0. and np.any(scores < threshold):
                             continue
@@ -394,6 +415,187 @@ class BaseOCR(BaseImageModel, BaseTextModel):
 
         return results
 
+    def stream_video(self,
+                     filename   = None,
+                     url    = None,
+                     detector   = 'east',
+                     max_time   = None,
+                     
+                     method = 'beam',
+                     dezoom_factor  = 1.1,
+                     
+                     save   = True,
+                     show   = True,
+                     save_frames    = True,
+                     directory  = None,
+                     output_file    = 'stream-{}.mp4',
+                     output_shape   = None,
+                     
+                     callback   = None,
+                     buffer_size    = 1,
+                     wait_factor    = 0.,
+                     duplicate_wait_time    = 0.2,
+                     
+                     threshold  = -0.2,
+                     region     = [0.25, 0.15, 0.6, 0.95],
+                     n_repeat   = 2,
+                     ** kwargs
+                    ):
+        ####################
+        #    OCR method    #
+        ####################
+        
+        _state  = {'prev_output' : None, 'n_skipped' : 0, 'n_duplicates' : 0}
+        emitted_texts, last_emitted = set(), []
+        
+        def perform_ocr(detected, image, infos):
+            if len(infos.get('boxes', {}).get('width', ())) == 0: return
+            
+            if _state['prev_output'] is not None:
+                dice = dice_coeff(infos['output'], _state['prev_output'])
+                if dice >= 0.9:
+                    _state['n_skipped'] += 1
+                    _state['n_duplicates'] += 1
+                    if not filename and _state['n_duplicates'] % 2 == 0:
+                        time.sleep(duplicate_wait_time)
+                    return
+            
+            res = self.predict(
+                {** infos, 'image' : image},
+
+                method = method,
+                num_sentences     = 1,
+                logits_filter     = logits_filter,
+                dezoom_factor     = dezoom_factor,
+
+                save       = False,
+                display    = False,
+                combine    = True,
+                box_filter = filters,
+                ** kwargs
+            )[0][-1]
+
+            if res.get('ocr', []):
+                res['ocr'] = [
+                    ocr_res for ocr_res in res['ocr']
+                    if _filter_results(
+                        ocr_res, emitted_texts, last_emitted, threshold = threshold, ** kwargs
+                    )
+                ]
+                if len(res['ocr']) == 0:
+                    _state['n_skipped'] += 1
+                    logger.info('[SKIP #{}] All results have been filtered !'.format(
+                        infos['frame_index']
+                    ))
+                    return
+
+                if _state['n_skipped']:
+                    logger.info('{} frames skipped ({} duplicates)'.format(
+                        _state['n_skipped'], _state['n_duplicates']
+                    ))
+                _state.update({'n_skipped' : 0, 'n_duplicates' : 0, 'prev_output' : infos['output']})
+
+                logger.info('\nFrame #{}'.format(infos['frame_index']))
+                if show: plot(detected)
+                for ocr_result in res['ocr']:
+                    last_emitted.append(ocr_result['text'])
+                    emitted_texts.add(ocr_result['text'])
+
+                    logger.info('Box  : {}\nScores : {}\nText   : {}'.format(
+                        np.around(convert_box_format(
+                            ocr_result['box'], BoxFormat.XYWH, box_mode = BoxFormat.CORNERS
+                        ), decimals = 3),
+                        np.around(ocr_result['scores'], decimals = 3),
+                        ocr_result['text']
+                    ))
+
+                    if callback: callback(ocr_result['text'])
+
+                    if show:
+                        show_boxes(image, ocr_result['box'], box_mode = ocr_result['box_mode'])
+                        if len(ocr_result['rows']) > 1:
+                            show_boxes(
+                                image,
+                                ocr_result['rows'],
+                                box_mode = ocr_result['box_mode'],
+                                ncols    = len(ocr_result['rows'])
+                            )
+
+                if save_frames:
+                    save_image(image = image, filename = os.path.join(
+                        frames_dir, 'frame_{}.jpg'.format(infos['frame_index'])
+                    ))
+                
+                if wait_factor > 0:
+                    time.sleep(
+                        1. + wait_factor * max([len(ocr_res['text']) for ocr_res in res['ocr']])
+                    )
+
+
+        ####################
+        #  Initialization  #
+        ####################
+        
+        if isinstance(detector, str):
+            from models import get_pretrained
+            detector = get_pretrained(detector)
+        
+        if not callable(callback):
+            assert hasattr(callback, 'put'), '`callback` must be callable or have a put method !'
+            callback = callback.put
+        
+        if max_time is None: max_time = 600 if not filename else 0
+        
+        if not save: save_frames = False
+        if directory is None: directory = self.stream_dir
+        output_file = os.path.join(directory, output_file)
+        if '{}' in output_file:
+            output_file = output_file.format(len(glob.glob(output_file.replace('{}', '*'))))
+        
+        basename    = os.path.basename(output_file)
+        frames_dir  = os.path.join(directory, basename) if save_frames else None
+        if save_frames: os.makedirs(frames_dir, exist_ok = True)
+        
+        # Initializes filters
+        filters = [SizeFilter(min_h = 0.025, min_w = 0.1),]
+        if region:      filters.append(RegionFilter(region = region, mode = 'center'))
+        if n_repeat:    filters.append(RepetitionFilter(n_repeat = n_repeat, filter_memory = False))
+
+        logits_filter = build_masking_filter(indices = self.text_encoder.ukn_token_idx)
+        
+        cam = filename
+        if not filename:
+            for _ in range(5):
+                cam = HTTPScreenMirror(url)
+                ret, frame  = cam.read()
+                if not ret:
+                    time.sleep(1)
+                else:
+                    output_shape    = frame.shape[:2]
+                    break
+            if not ret: raise RuntimeError('Unable to connect to {} !'.format(url))
+
+        if not save: output_file = None
+        detector.stream(
+            cam_id   = cam,
+            show     = False,
+            max_time    = max_time,
+            buffer_size  = buffer_size,
+
+            output_file  = output_file,
+            output_shape = output_shape,
+
+            save      = False,
+            verbose   = False,
+            display   = False,
+
+            return_output   = True,
+            post_processing = perform_ocr,
+            ** kwargs
+        )
+        logger.info('Stream finished and saved to {} !'.format(output_file))
+        return output_file
+
     def get_config(self, * args, ** kwargs):
         config = super().get_config(* args, ** kwargs)
         config.update({
@@ -420,8 +622,53 @@ def post_process(results, idx, display, post_processing):
                 ))
             
         if post_processing is not None:
-            post_processing(infos, image = file)
+            try:
+                post_processing(infos, image = file)
+            except Exception as e:
+                logger.error('An error occured in the `post_processing` function !\n  {}'.format(e))
         
         idx += 1
         
     return idx
+
+def _filter_results(ocr_result,
+                    reject,
+                    last_emitted    = [],
+                    threshold       = 0.,
+                    k   = 5,
+                    max_dist    = 0.2,
+                    skip_non_alpha  = True,
+                    skip_single_word    = True,
+                    ** kwargs
+                   ):
+    ocr_result['text'] = ocr_result['text'].replace('</s>', '')
+    text = ocr_result['text']
+    if not text: return False
+    elif skip_single_word and ' ' not in text: return False
+    elif skip_non_alpha and not any(c.isalpha() for c in text): return False
+    elif text in reject: return False
+    
+
+    ocr_result['scores'] = np.array(ocr_result['scores'])
+    if threshold != 0. and np.any(ocr_result['scores'] <= threshold):
+        logger.info('Some scores are too low : {} !'.format(
+            np.around(ocr_result['scores'], decimals = 3)
+        ))
+        if np.all(ocr_result['scores'] <= threshold): return False
+
+        parts = text.split(' \n')
+        logger.info('Parts : {}'.format(parts))
+        text = ' \n'.join([
+            p if s > threshold else '' for p, s in zip(parts, ocr_result['scores'])
+        ]).strip()
+        ocr_result['text'] = text
+    
+    if k > 0 and last_emitted:
+        for emitted in last_emitted[- k :]:
+            dist = edit_distance(emitted, text, normalize = True)
+            if dist < max_dist:
+                logger.info('Rejecting text due to an edit distance of {:.3f}\n  Text : {}\n  Previously emitted : {}'.format(dist, text, emitted))
+                reject.add(text)
+                return False
+
+    return True

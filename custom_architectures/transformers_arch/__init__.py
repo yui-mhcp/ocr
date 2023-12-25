@@ -1,5 +1,4 @@
-
-# Copyright (C) 2022 yui-mhcp project's author. All rights reserved.
+# Copyright (C) 2022-now yui-mhcp project's author. All rights reserved.
 # Licenced under the Affero GPL v3 Licence (the "Licence").
 # you may not use this file except in compliance with the License.
 # See the "LICENCE" file at the root of the directory for the licence information.
@@ -13,77 +12,61 @@
 import os
 import glob
 
-from utils.generic_utils import to_lower_keys
+from utils.wrapper_utils import partial
+
+_attributes = ('custom_objects', 'custom_functions', '_encoders', '_decoders', '_transformers')
+
+custom_objects = {}
+custom_functions = {}
+
+_encoders, _decoders, _transformers = {}, {}, {}
 
 def __load():
-    for module_name in glob.glob(os.path.join('custom_architectures', 'transformers_arch', '*.py')):
-        if module_name.endswith('__init__.py'): continue
+    for module_name in glob.glob(os.path.join(* __package__.split('.'), '*.py')):
+        if module_name.endswith(('__init__.py', '_old.py')): continue
         module_name = module_name.replace(os.path.sep, '.')[:-3]
 
-        module = __import__(
-            module_name,
-            fromlist = ['custom_objects', 'custom_functions', '_encoders', '_decoders', '_transformers']
-        )
-        if hasattr(module, 'custom_objects'):
-            custom_objects.update(module.custom_objects)
-        if hasattr(module, 'custom_functions'):
-            custom_functions.update(module.custom_functions)
-        if hasattr(module, '_encoders'):
-            _encoders.update(module._encoders)
-        if hasattr(module, '_decoders'):
-            _decoders.update(module._decoders)
-        if hasattr(module, '_transformers'):
-            _transformers.update(module._transformers)
-        else:
+        module = __import__(module_name, fromlist = _attributes)
+        
+        for attr_name in _attributes:
+            globals()[attr_name].update(getattr(module, attr_name, {}))
+
+        if not hasattr(module, '_transformers'):
             if hasattr(module, '_encoders'):
                 _transformers.update(module._encoders)
             if hasattr(module, '_decoders'):
                 _transformers.update(module._decoders)
 
-def _get_pretrained(pretrained_name,
-                    _possible_classes,
-                    _class_type = 'transformer',
-                    class_name  = None,
-                    wrapper = None,
-                    ** kwargs
-                   ):
-    if wrapper:
+def __get_pretrained(_cls, _name, pretrained_name, class_name = None, wrapper = None, ** kwargs):
+    if wrapper is not None:
         return wrapper.from_pretrained(
             pretrained_name = pretrained_name, class_name = class_name, ** kwargs
         )
+    
     if not class_name: class_name = pretrained_name
-    class_name = class_name.lower()
-    _possible_classes   = to_lower_keys(_possible_classes)
+    class_name  = class_name.lower()
+    candidates  = {k.lower() : v for k, v in _cls.items()}
     
-    if class_name in _possible_classes:
-        return _possible_classes[class_name].from_pretrained(
-            pretrained_name = pretrained_name, ** kwargs
-        )
+    cls = None
+    if class_name in candidates:
+        cls = candidates[class_name]
+    else:
+        for name, cand in sorted(candidates.items(), key = lambda p: len(p[0]), reverse = True):
+            if name in class_name:
+                cls = cand
+                break
     
-    for model_name, model_class in sorted(_possible_classes.items(), key = lambda p: len(p[0]), reverse = True):
-        if model_name in class_name:
-            return model_class.from_pretrained(pretrained_name = pretrained_name, ** kwargs)
-    
-    raise ValueError('Unknown {} class for pretrained model {}'.format(
-        _class_type, pretrained_name
-    ))
+    if cls is None:
+        raise ValueError('Unknown {} class for pretrained model {}\n  Candidates : {}'.format(
+            _name, pretrained_name, tuple(_cls.keys())
+        ))
 
-def get_pretrained_transformer_encoder(pretrained_name, ** kwargs):
-    return _get_pretrained(pretrained_name, _encoders, 'encoder', ** kwargs)
+    return cls.from_pretrained(pretrained_name = pretrained_name, ** kwargs)
 
-def get_pretrained_transformer_decoder(pretrained_name, ** kwargs):
-    return _get_pretrained(pretrained_name, _decoders, 'decoder', ** kwargs)
 
-def get_pretrained_transformer(pretrained_name, ** kwargs):
-    return _get_pretrained(pretrained_name, _transformers, 'transformers', ** kwargs)
-
-        
-custom_objects = {}
-custom_functions = {}
-
-_encoders   = {}
-_decoders   = {}
-_transformers   = {}
+get_pretrained_transformer      = partial(__get_pretrained, _transformers, 'transformer')
+get_pretrained_transformer_encoder  = partial(__get_pretrained, _encoders, 'encoder')
+get_pretrained_transformer_decoder  = partial(__get_pretrained, _decoders, 'decoder')
 
 __load()
 

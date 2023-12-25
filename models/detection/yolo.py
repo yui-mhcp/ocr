@@ -1,5 +1,4 @@
-
-# Copyright (C) 2022 yui-mhcp project's author. All rights reserved.
+# Copyright (C) 2022-now yui-mhcp project's author. All rights reserved.
 # Licenced under the Affero GPL v3 Licence (the "Licence").
 # you may not use this file except in compliance with the License.
 # See the "LICENCE" file at the root of the directory for the licence information.
@@ -15,7 +14,7 @@ import logging
 import numpy as np
 import tensorflow as tf
 
-from loggers import timer
+from loggers import timer, time_logger
 from utils import download_file
 from utils.image.box_utils import *
 from utils.distance.distance_method import iou
@@ -23,7 +22,6 @@ from custom_architectures import get_architecture
 from models.detection.base_detector import BaseDetector
 
 logger      = logging.getLogger(__name__)
-time_logger = logging.getLogger('timer')
 
 PRETRAINED_COCO_URL = 'https://pjreddie.com/media/files/yolov2.weights'
 
@@ -130,83 +128,77 @@ class YOLO(BaseDetector):
         
         if obj_threshold is None: obj_threshold = self.obj_threshold
         if nms_threshold is None: nms_threshold = self.nms_threshold
-        time_logger.start_timer('init')
         
-        grid_h, grid_w, nb_box = output.shape[:3]
-        nb_class = output.shape[3] - 5
-        
-        pos     = output[..., :4].numpy()
-        conf    = tf.sigmoid(output[..., 4:5]).numpy()
-        classes = tf.nn.softmax(output[..., 5:], axis = -1).numpy()
+        with time_logger.timer('init'):
+            grid_h, grid_w, nb_box = output.shape[:3]
+            nb_class = output.shape[3] - 5
 
-        time_logger.stop_timer('init')
-        time_logger.start_timer('preprocess')
+            pos     = output[..., :4].numpy()
+            conf    = tf.sigmoid(output[..., 4:5]).numpy()
+            classes = tf.nn.softmax(output[..., 5:], axis = -1).numpy()
 
         # decode the output by the network
         
-        scores  = conf * classes
-        scores[scores <= obj_threshold] = 0.
-        
-        class_scores = np.sum(scores, axis = -1)
+        with time_logger.timer('preprocess'):
+            scores  = conf * classes
+            scores[scores <= obj_threshold] = 0.
 
-        conf    = conf[..., 0]
-        candidates  = np.where(class_scores > 0.)
-        
-        time_logger.stop_timer('preprocess')
-        time_logger.start_timer('box filtering')
+            class_scores = np.sum(scores, axis = -1)
 
-        pos     = pos[candidates]
-        conf    = conf[candidates]
-        classes = classes[candidates]
+            conf    = conf[..., 0]
+            candidates  = np.where(class_scores > 0.)
         
-        row, col, box = candidates
-        x, y, w, h    = [pos[:, i] for i in range(4)]
-        
-        np_anchors = np.array(self.anchors)
-        
-        x = (col + _sigmoid(x)) / grid_w # center position, unit: image width
-        y = (row + _sigmoid(y)) / grid_h # center position, unit: image height
-        w = np_anchors[2 * box + 0] * np.exp(w) / grid_w # unit: image width
-        h = np_anchors[2 * box + 1] * np.exp(h) / grid_h # unit: image height
-        
-        x1 = np.maximum(0., x - w / 2.)
-        y1 = np.maximum(0., y - h / 2.)
-        x2 = np.minimum(1., x + w / 2.)
-        y2 = np.minimum(1., y + h / 2.)
-        
-        valids = np.logical_and(x1 < x2, y1 < y2)
-        boxes  = [BoundingBox(
-            x1 = float(x1i), y1 = float(y1i), x2 = float(x2i), y2 = float(y2i),
-            conf = c, classes = cl
-        ) for x1i, y1i, x2i, y2i, c, cl in zip(
-            x1[valids], y1[valids], x2[valids], y2[valids], conf[valids], classes[valids]
-        )]
+        with time_logger.timer('box filtering'):
+            pos     = pos[candidates]
+            conf    = conf[candidates]
+            classes = classes[candidates]
 
-        time_logger.stop_timer('box filtering')
-        time_logger.start_timer('NMS')
+            row, col, box = candidates
+            x, y, w, h    = [pos[:, i] for i in range(4)]
+
+            np_anchors = np.array(self.anchors)
+
+            x = (col + _sigmoid(x)) / grid_w # center position, unit: image width
+            y = (row + _sigmoid(y)) / grid_h # center position, unit: image height
+            w = np_anchors[2 * box + 0] * np.exp(w) / grid_w # unit: image width
+            h = np_anchors[2 * box + 1] * np.exp(h) / grid_h # unit: image height
+
+            x1 = np.maximum(0., x - w / 2.)
+            y1 = np.maximum(0., y - h / 2.)
+            x2 = np.minimum(1., x + w / 2.)
+            y2 = np.minimum(1., y + h / 2.)
+
+            valids = np.logical_and(x1 < x2, y1 < y2)
+            boxes  = [BoundingBox(
+                x1 = float(x1i), y1 = float(y1i), x2 = float(x2i), y2 = float(y2i),
+                conf = c, classes = cl
+            ) for x1i, y1i, x2i, y2i, c, cl in zip(
+                x1[valids], y1[valids], x2[valids], y2[valids], conf[valids], classes[valids]
+            )]
+
         # suppress non-maximal boxes
-        ious = {}
-        for c in range(nb_class):
-            scores = np.array([box.classes[c] for box in boxes])
-            sorted_indices = np.argsort(scores)[::-1]
-            sorted_indices = sorted_indices[scores[sorted_indices] > 0]
+        with time_logger.timer('NMS'):
+            ious = {}
+            for c in range(nb_class):
+                scores = np.array([box.classes[c] for box in boxes])
+                sorted_indices = np.argsort(scores)[::-1]
+                sorted_indices = sorted_indices[scores[sorted_indices] > 0]
 
-            for i, index_i in enumerate(sorted_indices):
-                if boxes[index_i].classes[c] == 0: continue
-                
-                for j in range(i + 1, len(sorted_indices)):
-                    index_j = sorted_indices[j]
-                    if boxes[index_j].classes[c] == 0: continue
+                for i, index_i in enumerate(sorted_indices):
+                    if boxes[index_i].classes[c] == 0: continue
 
-                    if (index_i, index_j) not in ious:
-                        ious[(index_i, index_j)] = iou(
-                            boxes[index_i], boxes[index_j], box_mode = BoxFormat.OBJECT
-                        )
-                    
-                    if ious[(index_i, index_j)] >= nms_threshold:
-                        boxes[index_j].classes[c] = 0
+                    for j in range(i + 1, len(sorted_indices)):
+                        index_j = sorted_indices[j]
+                        if boxes[index_j].classes[c] == 0: continue
+
+                        if (index_i, index_j) not in ious:
+                            ious[(index_i, index_j)] = iou(
+                                boxes[index_i], boxes[index_j], box_mode = BoxFormat.OBJECT
+                            )
+
+                        if ious[(index_i, index_j)] >= nms_threshold:
+                            boxes[index_j].classes[c] = 0
         
-        time_logger.stop_timer('NMS')
         # remove the boxes which are less likely than a obj_threshold
         boxes = [box for box in boxes if box.score > 0]
         return boxes

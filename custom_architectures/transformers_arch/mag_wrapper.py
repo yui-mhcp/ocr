@@ -1,5 +1,4 @@
-
-# Copyright (C) 2022 yui-mhcp project's author. All rights reserved.
+# Copyright (C) 2022-now yui-mhcp project's author. All rights reserved.
 # Licenced under the Affero GPL v3 Licence (the "Licence").
 # you may not use this file except in compliance with the License.
 # See the "LICENCE" file at the root of the directory for the licence information.
@@ -39,8 +38,8 @@ HParamsMAGWrapper = HParams(
     subsample_at    = -1,
     subsample_after = True,
     subsampling_step    = -1,
-    subsampling_offset  = 1,
     subsampling_mode    = 'select',
+    subsampling_offset  = 1,        # only used if `subsampling_mode == 'select'`
     subsampling_drop_rate   = 0.,
 
     repeat_pos_idx      = False,
@@ -107,7 +106,7 @@ def concat_embeddings(embeddings,
     
     if debug:
         tf.print("Sequence lengths :", lengths)
-        tf.print("1st input shape :", tf.shape(question))
+        tf.print("1st input shape :", tf.shape(query))
         tf.print("2nd input shape :", tf.shape(contexts))
         tf.print("Masks shape :", tf.shape(c_masks))
     
@@ -225,16 +224,13 @@ class MAGModelWrapper(tf.keras.Model):
         if self.subsampling_step > 1:
             self.subsampling_mode = get_enum_item(self.subsampling_mode, SubsamplingMode)
             
-            if self.subsampling_mode == SubsamplingMode.CONV:
-                self.subsampling_layer = tf.keras.layers.Conv1D(
-                    filters     = self.embedding_dim,
-                    kernel_size = self.subsampling_step,
-                    strides     = self.subsampling_step,
-                    padding     = 'valid',
-                    name    = 'subsampling_layer'
-                )
-            elif self.subsampling_mode == SubsamplingMode.SEPARABLE:
-                self.subsampling_layer = tf.keras.layers.SeparableConv1D(
+            if self.subsampling_mode in (SubsamplingMode.CONV, SubsamplingMode.SEPARABLE):
+                if self.subsampling_mode == SubsamplingMode.CONV:
+                    cls = tf.keras.layers.Conv1D
+                else:
+                    cls = tf.keras.layers.SeparableConv1D
+                
+                self.subsampling_layer = cls(
                     filters     = self.embedding_dim,
                     kernel_size = self.subsampling_step,
                     strides     = self.subsampling_step,
@@ -281,6 +277,9 @@ class MAGModelWrapper(tf.keras.Model):
         
         return [dummy_inputs, multi_dummy_inputs]
 
+    def set_tokens(self, * args, ** kwargs):
+        return self.model.set_tokens(* args, ** kwargs)
+    
     @timer
     def subsample(self, output, mask = None, training = False):
         if self.subsampling_step <= 1: return output, mask
@@ -361,6 +360,7 @@ class MAGModelWrapper(tf.keras.Model):
 
                      force_not_subsampling = False,
                      
+                     return_mask    = True,
                      as_dict    = True,
 
                      debug = False,
@@ -388,7 +388,7 @@ class MAGModelWrapper(tf.keras.Model):
 
         text = inputs
 
-        if debug: tf.print("Input tokens shape :", tf.shape(text), "-", input_length)
+        if debug: tf.print("Input tokens shape :", tf.shape(text))
         
         batch_size = tf.shape(text)[0]
         n_doc_per_batch = -1
@@ -406,8 +406,8 @@ class MAGModelWrapper(tf.keras.Model):
             first_layer_idx = -1,
             last_layer_idx  = self.M,
             
+            return_mask = True,
             as_dict = True,
-            debug   = debug,
             ** kwargs
         )
         
@@ -415,24 +415,26 @@ class MAGModelWrapper(tf.keras.Model):
 
         if not force_not_subsampling:
             output, mask = self.subsample(output, mask = mask, training = training)
-
             if debug: tf.print("Output subsampled shape :", tf.shape(output))
         
         if n_doc_per_batch != -1:
-            output  = tf.reshape(
-                output, [batch_size, n_doc_per_batch, tf.shape(output)[1], tf.shape(output)[-1]]
-            )
+            output  = tf.reshape(output, [
+                batch_size, n_doc_per_batch, tf.shape(output)[1], tf.shape(output)[2]
+            ])
             mask    = tf.reshape(mask,   [batch_size, n_doc_per_batch, 1, 1, tf.shape(mask)[-1]])
 
             if debug: tf.print("Output reshaped shape :", tf.shape(output))
         
-        return TransformerOutput(
-            output  = output,
+        return format_output(
+            output,
+            mask    = mask,
             state   = outputs.state,
             logits  = outputs.logits,
             attention_weights   = outputs.attention_weights,
-            hidden_states   = outputs.hidden_states,
-            mask    = mask
+            
+            return_mask = return_mask,
+            as_dict = as_dict,
+            ** kwargs
         )
     
     @timer
@@ -587,6 +589,9 @@ class MAGWrapper(tf.keras.Model):
     def _build(self, ** kwargs):
         return self(self.dummy_inputs, ** kwargs)
 
+    def set_tokens(self, * args, ** kwargs):
+        return self.model.set_tokens(* args, ** kwargs)
+    
     def call(self, * args, ** kwargs):
         return self.model(* args, ** kwargs)
     
@@ -620,10 +625,7 @@ class MAGWrapper(tf.keras.Model):
     
     @staticmethod
     def get_wrapper_kwargs():
-        return {
-            'encoder_wrapper'   : lambda encoder, ** kwargs: MAGModelWrapper(model = encoder, ** kwargs),
-            'encoder_wrapper_params'    : HParamsMAGWrapper
-        }
+        return {'encoder_wrapper'   : MAGModelWrapper}
 
 custom_objects  = {
     'MAG'   : MAGWrapper,

@@ -1,4 +1,4 @@
-# Copyright (C) 2022 yui-mhcp project's author. All rights reserved.
+# Copyright (C) 2022-now yui-mhcp project's author. All rights reserved.
 # Licenced under the Affero GPL v3 Licence (the "Licence").
 # you may not use this file except in compliance with the License.
 # See the "LICENCE" file at the root of the directory for the licence information.
@@ -18,28 +18,23 @@ import numpy as np
 import pandas as pd
 import tensorflow as tf
 
-from loggers import timer
+from loggers import timer, time_logger
 from utils.thread_utils import Consumer
-from custom_architectures import get_architecture
 from models.interfaces.base_image_model import BaseImageModel
 from utils import load_json, dump_json, normalize_filename, should_predict, get_filename, plot, pad_batch
 from utils.image import _video_formats, _image_formats, load_image, save_image, stream_camera, BASE_COLORS, get_video_infos
+from utils.image.box_utils.box_functions import _to_np
 from utils.image.box_utils import *
 
 logger      = logging.getLogger(__name__)
-time_logger = logging.getLogger('timer')
-
 
 class BaseDetector(BaseImageModel):
     get_input   = BaseImageModel.get_image
     augment_input   = BaseImageModel.augment_image
     preprocess_input    = BaseImageModel.preprocess_image
     
-    def decode_output(self, model_output, ** kwargs):
-        raise NotImplementedError()
-        
-    def get_output(self, data, ** kwargs):
-        raise NotImplementedError()
+    def decode_output(self, model_output, ** kwargs):   raise NotImplementedError()
+    def get_output(self, data, ** kwargs):              raise NotImplementedError()
     
     def __init__(self,
                  labels = None,
@@ -143,6 +138,7 @@ class BaseDetector(BaseImageModel):
                     len(boxes), '\n'.join(str(b) for b in boxes)
                 ))
 
+            boxes = sort_boxes(_to_np(boxes), method = 'top', ** kwargs)
             show_boxes(image, boxes, labels = kwargs.pop('labels', self.labels), ** kwargs)
         # Show original image with drawed boxes
         plot(detected, title = '{} object(s) detected'.format(len(boxes)), ** kwargs)
@@ -400,84 +396,78 @@ class BaseDetector(BaseImageModel):
         #  Initialization  #
         ####################
 
-        time_logger.start_timer('initialization')
+        with time_logger.timer('initialization'):
+            stop_saving_functions = False
+            if saving_functions is None:
+                stop_saving_functions   = True
+                saving_functions    = self._get_saving_functions(
+                    max_workers = max_workers, show_result_fn = self.show_result
+                )
 
-        stop_saving_functions = False
-        if saving_functions is None:
-            stop_saving_functions   = True
-            saving_functions    = self._get_saving_functions(
-                max_workers = max_workers, show_result_fn = self.show_result
-            )
+            if len(saving_functions) != 5:
+                raise ValueError('`saving_functions` must be of length 5 !')
 
-        if len(saving_functions) != 5:
-            raise ValueError('`saving_functions` must be of length 5 !')
-        
-        show_result_fn, save_json_fn, save_image_fn, save_detected_fn, save_boxes_fn = saving_functions
+            show_result_fn, save_json_fn, save_image_fn, save_detected_fn, save_boxes_fn = saving_functions
 
-        now = time.time()
-        
-        if isinstance(images, pd.DataFrame): images = images.to_dict('records')
-        if not isinstance(images, (list, tuple, np.ndarray, tf.Tensor)): images = [images]
-        elif isinstance(images, (np.ndarray, tf.Tensor)) and len(images.shape) == 3:
-            images = np.expand_dims(images, axis = 0)
+            now = time.time()
 
-        if save_detected or save_boxes: save = True
-        if display is None:         display = True if not save else False
-        if display in (-1, True):   display = len(images)
-        if display:                 verbose = max(verbose, 1)
-        
-        if directory is None: directory = self.pred_dir
-        map_file    = os.path.join(directory, 'map.json')
-        
-        required_keys   = ['boxes']
-        if save:
-            if raw_img_dir is None: raw_img_dir = os.path.join(directory, 'images')
-            if create_dirs: os.makedirs(raw_img_dir, exist_ok = True)
-            required_keys.append('filename')
-        
-        if save_detected:
-            if detected_dir is None: detected_dir = os.path.join(directory, 'detected')
-            if create_dirs: os.makedirs(detected_dir, exist_ok = True)
-            required_keys.append('detected')
+            if isinstance(images, pd.DataFrame): images = images.to_dict('records')
+            if not isinstance(images, (list, tuple, np.ndarray, tf.Tensor)): images = [images]
+            elif isinstance(images, (np.ndarray, tf.Tensor)) and len(images.shape) == 3:
+                images = np.expand_dims(images, axis = 0)
 
-        if save_boxes:
-            if boxes_dir is None: boxes_dir = os.path.join(directory, 'boxes')
-            if create_dirs: os.makedirs(boxes_dir, exist_ok = True)
-            required_keys.append('filename_boxes')
-        
-        if predicted is None:
-            predicted   = load_json(map_file, default = {})
-        
-        time_logger.stop_timer('initialization')
+            if save_detected or save_boxes: save = True
+            if display is None:         display = True if not save else False
+            if display in (-1, True):   display = len(images)
+            if display:                 verbose = max(verbose, 1)
+
+            if directory is None: directory = self.pred_dir
+            map_file    = os.path.join(directory, 'map.json')
+
+            required_keys   = ['boxes']
+            if save:
+                if raw_img_dir is None: raw_img_dir = os.path.join(directory, 'images')
+                if create_dirs: os.makedirs(raw_img_dir, exist_ok = True)
+                required_keys.append('filename')
+
+            if save_detected:
+                if detected_dir is None: detected_dir = os.path.join(directory, 'detected')
+                if create_dirs: os.makedirs(detected_dir, exist_ok = True)
+                required_keys.append('detected')
+
+            if save_boxes:
+                if boxes_dir is None: boxes_dir = os.path.join(directory, 'boxes')
+                if create_dirs: os.makedirs(boxes_dir, exist_ok = True)
+                required_keys.append('filename_boxes')
+
+            if predicted is None:
+                predicted   = load_json(map_file, default = {})
 
         ####################
         #  Pre-processing  #
         ####################
         
-        time_logger.start_timer('pre-processing')
-        
-        results     = [None] * len(images)
-        duplicatas  = {}
-        requested   = [(get_filename(img, keys = ('filename', )), img) for img in images]
-        
-        videos, inputs = [], []
-        for i, (file, img) in enumerate(requested):
-            if not should_predict(predicted, file, overwrite = overwrite, timestamp = timestamp, required_keys = required_keys):
-                results[i] = (file, predicted[file].get('detected', None), predicted[file])
-                continue
+        with time_logger.timer('pre-processing'):
+            results     = [None] * len(images)
+            duplicatas  = {}
+            requested   = [(get_filename(img, keys = ('filename', )), img) for img in images]
 
-            if isinstance(file, str):
-                duplicatas.setdefault(file, []).append(i)
-                
-                if file.endswith(_video_formats):
-                    videos.append(file)
+            videos, inputs = [], []
+            for i, (file, img) in enumerate(requested):
+                if not should_predict(predicted, file, overwrite = overwrite, timestamp = timestamp, required_keys = required_keys):
+                    results[i] = (file, predicted[file].get('detected', None), predicted[file])
                     continue
-                elif len(duplicatas[file]) > 1:
-                    continue
-            
-            inputs.append((i, file, img))
-        
-        time_logger.stop_timer('pre-processing')
+
+                if isinstance(file, str):
+                    duplicatas.setdefault(file, []).append(i)
+
+                    if file.endswith(_video_formats):
+                        videos.append(file)
+                        continue
+                    elif len(duplicatas[file]) > 1:
+                        continue
+
+                inputs.append((i, file, img))
 
         ####################
         #  Inference loop  #
@@ -489,22 +479,19 @@ class BaseDetector(BaseImageModel):
         
         if len(inputs) > 0:
             for start in range(0, len(inputs), batch_size):
-                time_logger.start_timer('batch processing')
-                
-                batch_inputs    = inputs[start : start + batch_size]
-                batch_images    = [_get_image(file, data) for _, file, data in batch_inputs]
-                
-                batch   = [self.get_input(image) for image in batch_images]
-                if len(batch) == 1:
-                    batch = tf.expand_dims(batch[0], axis = 0)
-                elif self.has_variable_input_size:
-                    batch = tf.cast(pad_batch(batch, dtype = np.float32), tf.float32)
-                else:
-                    batch = tf.stack(batch, axis = 0)
-                
-                batch = self.preprocess_input(batch)
-                
-                time_logger.stop_timer('batch processing')
+                with time_logger.timer('batch processing'):
+                    batch_inputs    = inputs[start : start + batch_size]
+                    batch_images    = [_get_image(file, data) for _, file, data in batch_inputs]
+
+                    batch   = [self.get_input(image) for image in batch_images]
+                    if len(batch) == 1:
+                        batch = tf.expand_dims(batch[0], axis = 0)
+                    elif self.has_variable_input_size:
+                        batch = tf.cast(pad_batch(batch, dtype = np.float32), tf.float32)
+                    else:
+                        batch = tf.stack(batch, axis = 0)
+
+                    batch = self.preprocess_input(batch)
 
                 # Computes detection + output decoding
                 boxes   = self.detect(
@@ -532,100 +519,90 @@ class BaseDetector(BaseImageModel):
                         results[idx] = (file, file, infos)
                         continue
                     
-                    time_logger.start_timer('post processing')
+                    with time_logger.timer('post processing'):
+                        basename, detected = None, None
+                        if save_detected or verbose or post_processing is not None or force_draw:
+                            with time_logger.timer('drawing boxes'):
+                                if isinstance(data, (dict, pd.Series)) and 'image_copy' in data:
+                                    detected = data['image_copy']
+                                elif isinstance(file, np.ndarray):
+                                    detected = image.copy() if save else file
+                                elif isinstance(file, tf.Tensor):
+                                    detected = file.numpy()
+                                else:
+                                    detected = image
 
-                    basename, detected = None, None
-                    if save_detected or verbose or post_processing is not None or force_draw:
-                        time_logger.start_timer('drawing boxes')
-                        
-                        if isinstance(data, (dict, pd.Series)) and 'image_copy' in data:
-                            detected = data['image_copy']
-                        elif isinstance(file, np.ndarray):
-                            detected = image.copy() if save else file
-                        elif isinstance(file, tf.Tensor):
-                            detected = file.numpy()
+                                detected    = self.draw_prediction(detected, box, ** kwargs)
+
+                        infos.update({'boxes' : box, 'timestamp' : now})
+                        if save:
+                            # Saves the raw image (i.e. if it is not already a filename)
+                            # The filename for the raw image is pre-computed here, even if `self.save_image` may do it, in order to allow multi-threading
+                            with time_logger.timer('saving frame'):
+                                if not isinstance(file, str):
+                                    if isinstance(data, (dict, pd.Series)) and 'frame_index' in data:
+                                        img_num = data['frame_index']
+                                    elif img_num == -1:
+                                        img_num = len(glob.glob(os.path.join(
+                                            raw_img_dir, filename.replace('{}', '*')
+                                        )))
+                                    img_file = os.path.join(raw_img_dir, filename.format(img_num))
+                                    img_num += 1
+
+                                    save_image_fn(file, filename = img_file, directory = raw_img_dir)
+                                    file    = img_file
+
+                                basename    = os.path.splitext(os.path.basename(file))[0]
+                                should_save     = True
+                                predicted[file] = infos
+
+                        if isinstance(file, str):
+                            infos['filename']   = file
+
+                        if save_detected:
+                            with time_logger.timer('saving detected'):
+                                detected_file = os.path.join(
+                                    detected_dir, detected_filename.format(basename)
+                                )
+                                save_detected_fn(
+                                    detected,
+                                    directory   = detected_dir,
+                                    filename    = detected_file
+                                )
+                                infos['detected'] = detected_file
+
+                        if save_boxes:
+                            with time_logger.timer('saving boxes'):
+                                box_files = [os.path.join(
+                                    boxes_dir, boxes_filename.format(basename, i)
+                                ) for i in range(len(box))]
+                                save_boxes_fn(
+                                    file,
+                                    image   = image,
+                                    boxes   = box,
+                                    labels  = self.labels,
+                                    directory   = boxes_dir,
+                                    file_format = box_files,
+                                    ** kwargs
+                                )
+                                infos['filename_boxes'] = {
+                                    box_file : get_box_infos(b, labels = self.labels, ** kwargs)
+                                    for box_file, b in zip(box_files, box)
+                                }
+
+                        # This ensures that the `infos` saved will not be modified by `post_process`
+                        infos = infos.copy()
+                        if return_output: infos['output'] = output
+                        # Sets result at the (multiple) index(es)
+                        if isinstance(file, str) and file in duplicatas:
+                            for duplicate_idx in duplicatas[file]:
+                                results[duplicate_idx] = (file, detected, infos)
                         else:
-                            detected = image
-                        
-                        detected    = self.draw_prediction(detected, box, ** kwargs)
-                        time_logger.stop_timer('drawing boxes')
-
-                    infos.update({'boxes' : box, 'timestamp' : now})
-                    if save:
-                        time_logger.start_timer('saving frame')
-                        # Saves the raw image (i.e. if it is not already a filename)
-                        # The filename for the raw image is pre-computed here, even if `self.save_image` may do it, in order to allow multi-threading
-                        if not isinstance(file, str):
-                            if isinstance(data, (dict, pd.Series)) and 'frame_index' in data:
-                                img_num = data['frame_index']
-                            elif img_num == -1:
-                                img_num = len(glob.glob(os.path.join(
-                                    raw_img_dir, filename.replace('{}', '*')
-                                )))
-                            img_file = os.path.join(raw_img_dir, filename.format(img_num))
-                            img_num += 1
-
-                            save_image_fn(file, filename = img_file, directory = raw_img_dir)
-                            file    = img_file
-                        
-                        basename    = os.path.splitext(os.path.basename(file))[0]
-                        should_save     = True
-                        predicted[file] = infos
-                        
-                        time_logger.stop_timer('saving frame')
-
-                    if isinstance(file, str):
-                        infos['filename']   = file
-                    
-                    if save_detected:
-                        time_logger.start_timer('saving detected')
-                        detected_file = os.path.join(
-                            detected_dir, detected_filename.format(basename)
-                        )
-                        save_detected_fn(
-                            detected,
-                            directory   = detected_dir,
-                            filename    = detected_file
-                        )
-                        infos['detected'] = detected_file
-                        time_logger.stop_timer('saving detected')
-
-                    if save_boxes:
-                        time_logger.start_timer('saving boxes')
-                        box_files = [os.path.join(
-                            boxes_dir, boxes_filename.format(basename, i)
-                        ) for i in range(len(box))]
-                        save_boxes_fn(
-                            file,
-                            image   = image,
-                            boxes   = box,
-                            labels  = self.labels,
-                            directory   = boxes_dir,
-                            file_format = box_files,
-                            ** kwargs
-                        )
-                        infos['filename_boxes'] = {
-                            box_file : get_box_infos(b, labels = self.labels, ** kwargs)
-                            for box_file, b in zip(box_files, box)
-                        }
-                        time_logger.stop_timer('saving boxes')
-
-                    # This ensures that the `infos` saved will not be modified by `post_process`
-                    infos = infos.copy()
-                    if return_output: infos['output'] = output
-                    # Sets result at the (multiple) index(es)
-                    if isinstance(file, str) and file in duplicatas:
-                        for duplicate_idx in duplicatas[file]:
-                            results[duplicate_idx] = (file, detected, infos)
-                    else:
-                        results[idx] = (file, detected, infos)
-                    
-                    time_logger.stop_timer('post processing')
+                            results[idx] = (file, detected, infos)
                 
                 if save and should_save:
-                    time_logger.start_timer('saving json')
-                    save_json_fn(map_file, data = predicted.copy(), indent = 4)
-                    time_logger.stop_timer('saving json')
+                    with time_logger.timer('saving json'):
+                        save_json_fn(map_file, data = predicted.copy(), indent = 4)
                 
                 show_idx    = post_process(
                     results, show_idx, verbose, display, show_result_fn, post_processing, ** plot_kwargs
@@ -902,7 +879,10 @@ def post_process(results, idx, verbose, max_display, show_result_fn, post_proces
             )
         
         if post_processing_fn is not None:
-            post_processing_fn(detected, image = image, infos = infos)
+            try:
+                post_processing_fn(detected, image = image, infos = infos)
+            except Exception as e:
+                logger.error('An error occured in the `post_processing` function !\n  {}'.format(e))
         
         idx += 1
 
