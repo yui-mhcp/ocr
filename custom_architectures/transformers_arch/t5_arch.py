@@ -126,14 +126,18 @@ class T5Block(TextTransformerBlock):
         )
         return values
     
-    def call(self, inputs, * args, positional_bias = None, ** kwargs):
-        if self.use_relative_positional_bias and positional_bias is None:
+    def call(self, inputs, * args, first_layer_idx = -1, positional_bias = None, ** kwargs):
+        if self.use_relative_positional_bias and positional_bias is None and first_layer_idx == -1:
             positional_bias = self.compute_bias(
                 tf.shape(inputs)[1], tf.shape(inputs)[1]
             )
         
         return super().call(
-            inputs, * args, attention_kwargs = {'positional_bias' : positional_bias}, ** kwargs
+            inputs,
+            * args,
+            first_layer_idx     = first_layer_idx,
+            attention_kwargs    = {'positional_bias' : positional_bias},
+            ** kwargs
         )
     
     @staticmethod
@@ -165,8 +169,7 @@ class T5Block(TextTransformerBlock):
                         ** kwargs
                        ):
         if pretrained is None:
-            with tf.device('cpu') as d:
-                pretrained = transformers_t5(pretrained_name, pretrained_task)
+            pretrained = transformers_t5(pretrained_name, pretrained_task)
 
         config = cls.default_params(
             max_input_length    = -1,
@@ -206,7 +209,7 @@ class T5Encoder(T5Block):
             'wi_0' : 'dense_1', 'wi_1' : 'up_proj', 'wo' : 'dense_2', r'layer_._\d/' : '',
             'layer_norm' : 'norm'
         })
-        super().transfer_weights(
+        return super().transfer_weights(
             {k : v for k, v in get_layers(pretrained).items() if 'decoder' not in k}, ** kwargs
         )
 
@@ -265,7 +268,7 @@ class T5Decoder(T5Block):
             'wi_0' : 'dense_1', 'wi_1' : 'up_proj', 'wo' : 'dense_2',
             r'layer_._\d/' : '', 'layer_norm' : 'norm'
         })
-        super().transfer_weights(
+        return super().transfer_weights(
             {k : v for k, v in get_layers(pretrained).items() if 'encoder' not in k}, ** kwargs
         )
 
@@ -284,6 +287,8 @@ class T5(TextTransformer):
             shared_layers   = {'token_embedding' : shared_embedding},
             ** kwargs
         )
+        with tf.name_scope(self.name):
+            self.shared_embedding = shared_embedding
 
     @classmethod
     def from_pretrained(cls,
@@ -294,8 +299,7 @@ class T5(TextTransformer):
                         ** kwargs
                        ):
         if pretrained is None:
-            with tf.device('cpu') as d:
-                pretrained = transformers_t5(pretrained_name, pretrained_task)
+            pretrained = transformers_t5(pretrained_name, pretrained_task)
 
         config = cls.default_params(
             vocab_size      = pretrained.config.vocab_size,

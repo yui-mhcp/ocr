@@ -303,9 +303,9 @@ class TextTransformerBlock(TransformerBlock):
         return tf.expand_dims(tf.range(9), axis = 0)
     
     def set_tokens(self, sos_token = None, eos_token = None, pad_token = None):
-        if sos_token is not None: self.sos_token.assign(sos_token)
-        if eos_token is not None: self.eos_token.assign(eos_token)
-        if pad_token is not None: self.pad_token.assign(pad_token)
+        if sos_token not in (-1, None): self.sos_token.assign(sos_token)
+        if eos_token not in (-1, None): self.eos_token.assign(eos_token)
+        if pad_token not in (-1, None): self.pad_token.assign(pad_token)
 
         self.hparams.update({
             'sos_token' : self.sos_token.numpy(),

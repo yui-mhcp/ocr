@@ -560,6 +560,8 @@ class MAGWrapper(tf.keras.Model):
         if not isinstance(model, Transformer):
             if not isinstance(model, MAGModelWrapper):
                 model = MAGModelWrapper(model, ** kwargs)
+        elif not isinstance(model.encoder, MAGModelWrapper):
+            model.encoder = MAGModelWrapper(model.encoder, ** kwargs)
         
         self.model = model
         
