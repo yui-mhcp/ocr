@@ -17,6 +17,7 @@ import tensorflow as tf
 from tqdm import tqdm
 
 from custom_layers import FasterEmbedding, MultiHeadAttention, HParamsMHA, get_activation
+from custom_architectures.transformers_arch.transformer_arch import _get_state_length, _get_state_step
 from custom_architectures.transformers_arch.embedding_head import EmbeddingHead, HParamsEmbeddingHead
 from custom_architectures.transformers_arch.text_transformer_arch import *
 
@@ -106,8 +107,8 @@ class T5Block(TextTransformerBlock):
                     name    = 'embeddings'
                 )
     
-    def compute_bias(self, q_len, k_len):
-        q_pos   = tf.range(q_len)[:, tf.newaxis]
+    def compute_bias(self, q_len, k_len, q_offset = 0):
+        q_pos   = tf.range(q_len)[:, tf.newaxis] + q_offset
         k_pos   = tf.range(k_len)[tf.newaxis, :]
         rel_pos = k_pos - q_pos
         
@@ -126,15 +127,29 @@ class T5Block(TextTransformerBlock):
         )
         return values
     
-    def call(self, inputs, * args, first_layer_idx = -1, positional_bias = None, ** kwargs):
+    def call(self,
+             inputs,
+             * args,
+             initial_state  = None,
+             first_layer_idx    = -1,
+             positional_bias    = None,
+             ** kwargs
+            ):
         if self.use_relative_positional_bias and positional_bias is None and first_layer_idx == -1:
+            seq_len     = tf.shape(inputs)[1]
+            state_len   = _get_state_length(initial_state)
+            step        = _get_state_step(initial_state)
+            if kwargs.get('debug', False):
+                tf.print('seq :', seq_len, 'state len :', state_len, 'step :', step)
+            
             positional_bias = self.compute_bias(
-                tf.shape(inputs)[1], tf.shape(inputs)[1]
+                seq_len, seq_len + state_len, step
             )
         
         return super().call(
             inputs,
             * args,
+            initial_state   = initial_state,
             first_layer_idx     = first_layer_idx,
             attention_kwargs    = {'positional_bias' : positional_bias},
             ** kwargs

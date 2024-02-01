@@ -138,8 +138,9 @@ class BaseDetector(BaseImageModel):
                     len(boxes), '\n'.join(str(b) for b in boxes)
                 ))
 
-            boxes = sort_boxes(_to_np(boxes), method = 'top', ** kwargs)
-            show_boxes(image, boxes, labels = kwargs.pop('labels', self.labels), ** kwargs)
+            if len(boxes) > 0:
+                boxes = sort_boxes(_to_np(boxes), method = 'top', ** kwargs)
+                show_boxes(image, boxes, labels = kwargs.pop('labels', self.labels), ** kwargs)
         # Show original image with drawed boxes
         plot(detected, title = '{} object(s) detected'.format(len(boxes)), ** kwargs)
 

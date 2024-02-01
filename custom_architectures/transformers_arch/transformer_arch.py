@@ -19,6 +19,7 @@ from tensorflow.keras.models import model_from_json
 
 from hparams import HParams
 from loggers import timer, time_logger
+from utils.tensorflow_utils import tf_compile
 from custom_layers import get_activation, MultiHeadAttention, HParamsMHA
 
 TransformerOutput = collections.namedtuple(
@@ -89,15 +90,26 @@ def _get_state_length(state):
     flattened = tf.nest.flatten(state)
     return tf.shape(flattened[0])[-2] if flattened[0] is not None else 0
 
-def build_padding_mask(seq, mask = None, lengths = None, pad_value = 0, maxlen = None, dtype = tf.bool):
+def _get_state_step(state):
+    if not state: return 0
+    return 1 + tf.cast(tf.reduce_max(tf.where(
+        tf.nest.flatten(state)[0][0, 0, :, 0] != 0.
+    )), tf.int32)
+
+def build_padding_mask(seq,
+                       lengths  = None,
+                       pad_value    = None,
+                       maxlen   = None,
+                       mask     = None,
+                       dtype    = tf.bool
+                      ):
     """
         Return padding mask matching attention shape [batch_size, 1, 1, max(lengths)]
         The mask is `False` (or 0) if the value should be masked and `True` (or 1) otherwise
     """
     if mask is not None:
         if mask.dtype != dtype: mask = tf.cast(mask, dtype)
-        if len(mask.shape) == 4: return mask
-        return tf.reshape(mask, [tf.shape(mask)[0], 1, 1, tf.shape(mask)[1]])
+        return mask if len(mask.shape) == 4 else mask[:, tf.newaxis, tf.newaxis, :]
     
     if lengths is None:
         if len(seq.shape) == 2:
@@ -113,7 +125,7 @@ def build_padding_mask(seq, mask = None, lengths = None, pad_value = 0, maxlen =
         if maxlen is None: maxlen = tf.shape(seq)[1]
         mask = tf.sequence_mask(lengths, maxlen = maxlen, dtype = dtype)
     
-    return tf.reshape(mask, [tf.shape(seq)[0], 1, 1, -1])
+    return mask[:, tf.newaxis, tf.newaxis, :]
 
 def build_look_ahead_mask(batch_size, size, dtype = tf.bool):
     """
@@ -192,6 +204,7 @@ def build_mask(inputs,
                padding_mask = None,
                look_ahead_mask  = None,
                initial_state    = None,
+               embedded = None,
                
                dtype    = tf.bool
               ):
@@ -199,18 +212,20 @@ def build_mask(inputs,
         if len(mask.shape) == 4: return mask
         padding_mask = mask
 
-    offset = _get_state_length(initial_state)
-    maxlen = tf.shape(inputs)[1] + offset
+    batch   = tf.shape(embedded if embedded is not None else inputs)[0]
+    seq_len = tf.shape(embedded if embedded is not None else inputs)[1]
+    offset  = _get_state_length(initial_state)
+    maxlen  = seq_len + offset
+    
     padding_mask = build_padding_mask(
-        inputs, mask = padding_mask, lengths = lengths, maxlen = maxlen, pad_value = pad_value,
-        dtype = dtype
+        inputs, lengths, mask = padding_mask, maxlen = maxlen, pad_value = pad_value, dtype = dtype
     )
     
-    if not use_causal_attention or padding_mask.shape[-1] == 1: return padding_mask
+    if not use_causal_attention or initial_state: return padding_mask
 
     if look_ahead_mask is None:
         look_ahead_mask = build_look_ahead_mask(
-            tf.shape(inputs)[0], tf.shape(padding_mask)[-1], dtype = dtype
+            batch, seq_len, dtype = dtype
         )
     
     return combine_masks(padding_mask, look_ahead_mask)
@@ -443,8 +458,11 @@ class TransformerLayer(tf.keras.layers.Layer):
             inputs = self.norm(inputs, training = training and self.norm_training)
 
         attn_state, enc_attn_state = None, None
-        if initial_state:
-            attn_state, enc_attn_state = initial_state if self.enc_attention is not None else (initial_state, None)
+        if initial_state is not None:
+            if self.enc_attention is not None:
+                attn_state, enc_attn_state = initial_state
+            else:
+                attn_state = initial_state
 
         with time_logger.timer('self MHA call'):
             attn_outputs    = self.attention(
@@ -629,7 +647,7 @@ class TransformerBlock(tf.keras.Model):
         
         return output
     
-    @timer(name = 'Transformer block call')
+    #@timer(name = 'Transformer block call')
     def call(self,
              inputs,
              input_length   = None,
@@ -690,6 +708,7 @@ class TransformerBlock(tf.keras.Model):
                 initial_state   = initial_state,
                 
                 training    = training,
+                padding_mask    = padding_mask,
                 mask    = mask,
                 ** kwargs
             )
@@ -697,6 +716,7 @@ class TransformerBlock(tf.keras.Model):
 
         mask = self._layers[0].compute_mask(
             inputs,
+            embedded    = output,
             input_length    = input_length,
             padding_mask    = padding_mask,
             look_ahead_mask = look_ahead_mask,
@@ -708,7 +728,7 @@ class TransformerBlock(tf.keras.Model):
                 output,
                 input_length    = input_length,
                 encoder_output  = encoder_output,
-                initial_state   = None if initial_state is None else initial_state.get(layer.name, None),
+                initial_state   = None if not initial_state else initial_state.get(layer.name, None),
                 
                 training    = training,
                 
@@ -924,7 +944,6 @@ class Transformer(tf.keras.Model):
         return [self.encoder.dummy_inputs, self.decoder.dummy_inputs]
     
     @timer(name = 'encoder call')
-    @tf.function(reduce_retracing = True)
     def encode(self,
                inputs,
                input_length = None,
@@ -956,7 +975,7 @@ class Transformer(tf.keras.Model):
             ** kwargs
         )
 
-    @timer(name = 'Transformer call')
+    #@timer(name = 'Transformer call')
     def call(self,
              inputs,
              input_length   = None,
@@ -1040,13 +1059,16 @@ class Transformer(tf.keras.Model):
         )
     
     @timer(name = 'Transformer inference')
+    @tf_compile(
+        reduce_retracing = True, support_xla = True, follow_type_hints = True, cast_kwargs = True
+    )
     def infer(self,
-              inputs,
-              input_length  = None,
-              initial_state = None,
+              inputs    : tf.Tensor,
+              input_length  : tf.Tensor = None,
+              initial_state : tf.Tensor = None,
 
-              enc_padding_mask  = None,
-              padding_mask  = None,
+              enc_padding_mask  : tf.Tensor = None,
+              padding_mask  : tf.Tensor = None,
               training  = False,
               
               return_state      = False,
@@ -1058,7 +1080,7 @@ class Transformer(tf.keras.Model):
 
               ** kwargs
              ):
-        encoder_outputs = self.encode(
+        encoder_outputs = self.encoder(
             inputs,
             input_length    = input_length,
             

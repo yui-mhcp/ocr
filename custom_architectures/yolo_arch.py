@@ -22,6 +22,10 @@ logger = logging.getLogger(__name__)
 FULL_YOLO_BACKEND_PATH  = "pretrained_models/yolo_backend/full_yolo_backend.h5"
 TINY_YOLO_BACKEND_PATH  = "pretrained_models/yolo_backend/tiny_yolo_backend.h5"
 
+class SpaseToDepth(tf.keras.layers.Layer):
+    def call(self, inputs):
+        return space_to_depth_x2(inputs)
+
 def space_to_depth_x2(x):
     import tensorflow as tf
     return tf.nn.space_to_depth(x, block_size = 2)
@@ -151,7 +155,7 @@ def FullYoloBackend(input_shape,
 
         name = 'conv_21'
     )
-    skip_connection = tf.keras.layers.Lambda(space_to_depth_x2)(skip_connection)
+    skip_connection = SpaseToDepth()(skip_connection)
 
     x = tf.keras.layers.Concatenate()([skip_connection, x])
 
@@ -284,6 +288,10 @@ def YOLO(feature_extractor,
         layer.set_weights([new_kernel, new_bias])
 
     return model
+
+custom_objects  = {
+    'SpaseToDepth'  : SpaseToDepth
+}
 
 custom_functions    = {
     'full_yolo' : FullYoloBackend,

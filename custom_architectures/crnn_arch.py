@@ -15,6 +15,7 @@ import collections
 import numpy as np
 import tensorflow as tf
 
+from utils.tensorflow_utils import tf_compile
 from custom_layers import get_activation, log_softmax, FasterEmbedding
 from custom_architectures.current_blocks import Conv2DBN
 from custom_architectures.generation_utils import infer
@@ -498,16 +499,22 @@ class CRNNWithAttn(tf.keras.Model):
         self.attn_cell  = AttentionCell(hidden_size = attention_dim, name = 'attention_cell')
         self.decoder    = tf.keras.layers.Dense(vocab_size, name = 'generator')
         
-        with tf.name_scope(self.name):
-            self.sos_token   = tf.Variable(
-                kwargs.pop('sos_token', -1), trainable = False, dtype = tf.int32, name = 'sos_token'
-            )
-            self.eos_token   = tf.Variable(
-                kwargs.pop('eos_token', -1), trainable = False, dtype = tf.int32, name = 'eos_token'
-            )
-            self.pad_token   = tf.Variable(
-                kwargs.pop('pad_token', -1), trainable = False, dtype = tf.int32, name = 'pad_token'
-            )
+        self.sos_token  = kwargs.pop('sos_token', -1)
+        self.eos_token  = kwargs.pop('eos_token', -1)
+        self.pad_token  = kwargs.pop('pad_token', -1)
+    
+    def token_setter(self, name, val):
+        setattr(self, '_' + name, tf.constant(val, dtype = tf.int32, name = name))
+    
+    sos_token   = property(
+        lambda self: self._sos_token, lambda self, val: self.token_setter('sos_token', val)
+    )
+    eos_token   = property(
+        lambda self: self._eos_token, lambda self, val: self.token_setter('eos_token', val)
+    )
+    pad_token   = property(
+        lambda self: self._pad_token, lambda self, val: self.token_setter('pad_token', val)
+    )
 
     def _build(self):
         inp_shape = tuple(s if s is not None else 64 for s in self.inp_shape)
@@ -524,9 +531,9 @@ class CRNNWithAttn(tf.keras.Model):
         self.embedding_layer.change_vocabulary(vocab, ** kwargs)
     
     def set_tokens(self, sos_token = None, eos_token = None, pad_token = None):
-        if sos_token is not None: self.sos_token.assign(sos_token)
-        if eos_token is not None: self.eos_token.assign(eos_token)
-        if pad_token is not None: self.pad_token.assign(pad_token)
+        if sos_token not in (-1, None): self.sos_token = sos_token
+        if eos_token not in (-1, None): self.eos_token = eos_token
+        if pad_token not in (-1, None): self.pad_token = pad_token
     
     def one_hot_initializer(self, shape, dtype):
         return tf.eye(shape[0], dtype = dtype)
@@ -592,8 +599,13 @@ class CRNNWithAttn(tf.keras.Model):
              training = False,
              attn_mask_offset  = 5,
              attn_mask_win_len = 16,
+             
+             debug  = False,
              ** kwargs
             ):
+        if initial_state is None:
+            initial_state = self.get_initial_state(tf.shape(inputs)[0], self.compute_dtype)
+        
         if len(tf.shape(inputs)) == 2: inputs = tf.squeeze(inputs, axis = 1)
         inputs = tf.ensure_shape(inputs, (None, ))
         
@@ -630,7 +642,8 @@ class CRNNWithAttn(tf.keras.Model):
 
         finish_mask = main_attention > encoder_len
         if tf.reduce_any(finish_mask):
-            tf.print('Attention :', main_attention, '- length :', encoder_len, '- next token :', tf.argmax(logit, axis = -1))
+            if debug:
+                tf.print('Attention :', main_attention, '- length :', encoder_len, '- next token :', tf.argmax(logit, axis = -1))
             eos_mask    = tf.tensor_scatter_nd_update(
                 tf.fill((1, self.vocab_size), logit.dtype.min), [[0, self.eos_token]], [0.]
             )
@@ -642,7 +655,10 @@ class CRNNWithAttn(tf.keras.Model):
             attention_weights = attn
         )
 
-    @tf.function(reduce_retracing = True)
+    #@tf.function(reduce_retracing = True)
+    @tf_compile(
+        reduce_retracing = True, support_xla = True, follow_type_hints = True, cast_kwargs = True
+    )
     def infer(self,
               inputs : tf.Tensor,
               training      = False,

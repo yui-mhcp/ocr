@@ -99,9 +99,10 @@ def get_shape_invariant(model,
 
 @timer(name = 'decoder inference')
 def infer(model, * args, method = 'greedy', ** kwargs):
-    return get_object(
-        _inference_methods, method, model, * args, ** kwargs
-    )
+    return _inference_methods[method](model, * args, ** kwargs)
+    #return get_object(
+    #    _inference_methods, method, model, * args, ** kwargs
+    #)
 
 @tf.function(reduce_retracing = True, experimental_follow_type_hints = True)
 def _infer(self,
