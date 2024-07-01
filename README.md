@@ -1,6 +1,4 @@
-# :yum: Optical Character Recognition
-
-**NEW** : this repository is new and experimental, do not hesitate to open issues if you have any question or bug, or even suggestions to improve the project ! :yum:
+# :yum: Optical Character Recognition (OCR)
 
 Check the [CHANGELOG](https://github.com/yui-mhcp/yui-mhcp/blob/main/CHANGELOG.md) file to have a global overview of the latest modifications ! :yum:
 
@@ -9,12 +7,11 @@ Check the [CHANGELOG](https://github.com/yui-mhcp/yui-mhcp/blob/main/CHANGELOG.m
 ```bash
 ├── custom_architectures
 │   ├── crnn_arch.py        : defines the CRNN main architecture for OCR (with CTC decoding)
-│   ├── unet_arch.py        : defines variants of the UNet architectures used in the EAST detector
+│   ├── generation_utils.py : inference methods for CRNN with attention model *
+│   ├── east_arch.py        : defines EAST text detector architecture
 │   └── yolo_arch.py        : defines the YOLOv2 architecture
 ├── custom_layers
 ├── custom_train_objects
-├── datasets
-├── hparams
 ├── loggers
 ├── models
 │   ├── detection           : used to detect texts in images (with the EAST detector)
@@ -23,11 +20,13 @@ Check the [CHANGELOG](https://github.com/yui-mhcp/yui-mhcp/blob/main/CHANGELOG.m
 │   │   └── crnn.py         : main CRNN class (OCR)
 ├── pretrained_models
 │   └── yolo_backend        : directory where to save the yolo_backend weights
-├── unitest
+├── unitests
 ├── utils
 ├── example_crnn.ipynb
 └── pcr.ipynb
 ```
+
+\* This architecture is still experimental. Pretrained models / examples will be provided in the next update
 
 Check [the main project](https://github.com/yui-mhcp/base_dl_project) for more information about the unextended modules / structure / main classes. 
 
@@ -35,7 +34,7 @@ Check [the detection project](https://github.com/yui-mhcp/detection) for more in
 
 ## Available features
 
-- **Detection** (module `models.detection`) :
+- **OCR** (module `models.ocr`) :
 
 | Feature   | Fuction / class   | Description |
 | :-------- | :---------------- | :---------- |
@@ -60,18 +59,16 @@ Available architectures :
 
 Models must be unzipped in the `pretrained_models/` directory !
 
-The pretrained `CRNN` models come from the [EasyOCR](https://github.com/JaidedAI/EasyOCR) library. Weights are automatically downloaded given the language or the model's name, and converted in `tensorflow` ! The `easyocr` is therefore not required, by `pytorch` is required for weights loading (for convertion).
+The pretrained `CRNN` models come from the [EasyOCR](https://github.com/JaidedAI/EasyOCR) library. Weights are automatically downloaded given the language or the model name, and converted in `keras` ! The `easyocr` is therefore not required, while `pytorch` is required for weights loading (for convertion).
 
-The pretrained version of EAST can be downloaded [from this project](https://github.com/SakuraRiven/EAST). It should be set in `pretrained_models/pretrained_weights/east_vgg16.pth` (`torch` is required to transfer the weights : `pip install torch`).
+The pretrained version of EAST can be downloaded [from this project](https://github.com/SakuraRiven/EAST). It should be placed in `pretrained_models/pretrained_weights/east_vgg16.pth` (`torch` is required to convert the weights : `pip install torch`).
 
 ## Installation and usage
 
 1. Clone this repository : `git clone https://github.com/yui-mhcp/ocr.git`
 2. Go to the root of this repository : `cd ocr`
 3. Install requirements : `pip install -r requirements.txt`
-4. Open `detection` notebook and follow the instructions !
-
-**Important Note** : some *heavy* requirements are removed in order to avoid unnecessary installation of such packages (e.g. `torch` and `transformers`), as they are used only in very specific functions.  It is therefore possible that some `ImportError` occurs when using specific functions, such as `TextEncoder.from_transformers_pretrained(...)`. 
+4. Open `ocr` notebook and follow the instructions !
 
 ## TO-DO list :
 
@@ -86,18 +83,23 @@ The pretrained version of EAST can be downloaded [from this project](https://git
 
 ## Contacts and licence
 
-You can contact [me](https://github.com/yui-mhcp) at yui-mhcp@tutanota.com or on [discord](https://discord.com) at `yui#0732`
+Contacts :
+- **Mail** : `yui-mhcp@tutanota.com`
+- **[Discord](https://discord.com)** : yui0732
 
-The objective of these projects is to facilitate the development and deployment of useful application using Deep Learning for solving real-world problems and helping people. 
-For this purpose, all the code is under the [Affero GPL (AGPL) v3 licence](LICENCE)
+### Terms of use
 
-All my projects are "free software", meaning that you can use, modify, deploy and distribute them on a free basis, in compliance with the Licence. They are not in the public domain and are copyrighted, there exist some conditions on the distribution but their objective is to make sure that everyone is able to use and share any modified version of these projects. 
+The goal of these projects is to support and advance education and research in Deep Learning technology. To facilitate this, all associated code is made available under the [GNU Affero General Public License (AGPL) v3](AGPLv3.licence), supplemented by a clause that prohibits commercial use (cf the [LICENCE](LICENCE) file).
 
-Furthermore, if you want to use any project in a closed-source project, or in a commercial project, you will need to obtain another Licence. Please contact me for more information. 
+These projects are released as "free software", allowing you to freely use, modify, deploy, and share the software, provided you adhere to the terms of the license. While the software is freely available, it is not public domain and retains copyright protection. The license conditions are designed to ensure that every user can utilize and modify any version of the code for their own educational and research projects.
 
-For my protection, it is important to note that all projects are available on an "As Is" basis, without any warranties or conditions of any kind, either explicit or implied. However, do not hesitate to report issues on the repository's project or make a Pull Request to solve it :smile: 
+If you wish to use this project in a proprietary commercial endeavor, you must obtain a separate license. For further details on this process, please contact me directly.
 
-If you use this project in your work, please add this citation to give it more visibility ! :yum:
+For my protection, it is important to note that all projects are available on an "As Is" basis, without any warranties or conditions of any kind, either explicit or implied. However, do not hesitate to report issues on the repository's project, or make a Pull Request to solve it :smile: 
+
+### Citation
+
+If you find this project useful in your work, please add this citation to give it more visibility ! :yum:
 
 ```
 @misc{yui-mhcp
@@ -109,19 +111,19 @@ If you use this project in your work, please add this citation to give it more v
 }
 ```
 
-## Notes and references
+## Notes and references 
 
 The code for the CRNN architecture is highly inspired from the `easyocr` repo :
-- [1] [EasyOCR library](https://github.com/JaidedAI/EasyOCR) : official repo of the `easyocr` library
+- [EasyOCR library](https://github.com/JaidedAI/EasyOCR) : official repo of the `easyocr` library
 The code for the EAST part of this project is highly inspired from this repo :
-- [2] [SakuraRiven pytorch implementation](https://github.com/SakuraRiven/EAST) : pytorch implementation of the EAST paper.
+- [SakuraRiven pytorch implementation](https://github.com/SakuraRiven/EAST) : pytorch implementation of the EAST paper.
 
 
 Papers and tutorials :
-- [1] [An End-to-End Trainable Neural Network for Image-based Sequence Recognition and Its Application to Scene Text Recognition](https://arxiv.org/abs/1507.05717) : the original CRNN paper
-- [2] [What Is Wrong With Scene Text Recognition Model Comparisons? Dataset and Model Analysis](https://arxiv.org/abs/1904.01906) : a great benchmark of OCR model + an open-source repository with pretrained models and datasets
-- [3] [U-Net: Convolutional Networks for Biomedical Image Segmentation](https://arxiv.org/abs/1505.04597) : U-net original paper
-- [4] [EAST: An Efficient and Accurate Scene Text Detector](https://arxiv.org/abs/1704.03155) : text detection (with possibly rotated bounding-boxes) with a segmentation model (U-Net). 
+- [An End-to-End Trainable Neural Network for Image-based Sequence Recognition and Its Application to Scene Text Recognition](https://arxiv.org/abs/1507.05717) : the original CRNN paper
+- [What Is Wrong With Scene Text Recognition Model Comparisons? Dataset and Model Analysis](https://arxiv.org/abs/1904.01906) : a great benchmark of OCR model + an open-source repository with pretrained models and datasets
+- [U-Net: Convolutional Networks for Biomedical Image Segmentation](https://arxiv.org/abs/1505.04597) : U-net original paper
+- [EAST: An Efficient and Accurate Scene Text Detector](https://arxiv.org/abs/1704.03155) : text detection (with possibly rotated bounding-boxes) with a segmentation model (U-Net). 
 
 
 Datasets :

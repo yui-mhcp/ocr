@@ -1,5 +1,5 @@
-# Copyright (C) 2022-now yui-mhcp project's author. All rights reserved.
-# Licenced under the Affero GPL v3 Licence (the "Licence").
+# Copyright (C) 2022-now yui-mhcp project author. All rights reserved.
+# Licenced under a modified Affero GPL v3 Licence (the "Licence").
 # you may not use this file except in compliance with the License.
 # See the "LICENCE" file at the root of the directory for the licence information.
 #
@@ -16,76 +16,54 @@ import shutil
 import logging
 import numpy as np
 import pandas as pd
-import tensorflow as tf
 
+from utils import Consumer, load_json, dump_json, normalize_filename, should_predict, get_filename, plot, pad_batch
+
+from utils.image import *
+from utils.keras_utils import ops
 from loggers import timer, time_logger
-from utils.thread_utils import Consumer
+from utils.image import _video_formats, _image_formats
+from models.interfaces.base_model import BaseModel
 from models.interfaces.base_image_model import BaseImageModel
-from utils import load_json, dump_json, normalize_filename, should_predict, get_filename, plot, pad_batch
-from utils.image import _video_formats, _image_formats, load_image, save_image, stream_camera, BASE_COLORS, get_video_infos
-from utils.image.box_utils.box_functions import _to_np
-from utils.image.box_utils import *
+from models.interfaces.base_classification_model import BaseClassificationModel
 
 logger      = logging.getLogger(__name__)
 
-class BaseDetector(BaseImageModel):
-    get_input   = BaseImageModel.get_image
+class BaseDetector(BaseClassificationModel, BaseImageModel):
+    _directories    = {
+        ** BaseModel._directories, 'stream_dir' : '{root}/{self.name}/stream'
+    }
+    
+    prepare_input   = BaseImageModel.get_image
     augment_input   = BaseImageModel.augment_image
-    preprocess_input    = BaseImageModel.preprocess_image
+    process_input   = BaseImageModel.process_image
     
     def decode_output(self, model_output, ** kwargs):   raise NotImplementedError()
-    def get_output(self, data, ** kwargs):              raise NotImplementedError()
+    def prepare_output(self, data, ** kwargs):          raise NotImplementedError()
     
-    def __init__(self,
-                 labels = None,
-                 nb_class   = None,
-                 input_size = None,
-                 
-                 obj_threshold  = 0.35,
-                 nms_threshold  = 0.2,
-
-                 ** kwargs
-                ):
-        self._init_image(input_size = input_size, ** kwargs)
-
-        if labels is None: labels = ['object']
-        self.labels   = list(labels) if not isinstance(labels, str) else [labels]
-        self.nb_class = max(len(self.labels), nb_class if nb_class is not None else 1)
-        if self.nb_class > len(self.labels):
-            self.labels += [''] * (self.nb_class - len(self.labels))
+    def __init__(self, labels = None, *, obj_threshold  = 0.35, nms_threshold  = 0.2, ** kwargs):
+        self._init_image(** kwargs)
+        self._init_labels(labels if labels is not None else ['object'], ** kwargs)
 
         self.obj_threshold  = obj_threshold
         self.nms_threshold  = nms_threshold
         
-        self.label_to_idx   = {label : i for i, label in enumerate(self.labels)}
-        
         super(BaseDetector, self).__init__(** kwargs)
-    
-    @property
-    def stream_dir(self):
-        return os.path.join(self.folder, "stream")
-    
-    @property
-    def use_labels(self):
-        return False if self.nb_class == 1 else True
 
     @property
     def training_hparams(self):
         return super().training_hparams(** self.training_hparams_image)
     
     def __str__(self):
-        des = super().__str__()
-        des += self._str_image()
-        des += "- Labels (n = {}) : {}\n".format(len(self.labels), self.labels)
-        return des
+        return super().__str__() + self._str_image() + self._str_labels()
 
     @timer(name = 'inference', log_if_root = False)
-    def detect(self, image, get_boxes = False, training = False, return_output = False, ** kwargs):
+    def detect(self, inputs, get_boxes = False, return_output = False, ** kwargs):
         """
             Performs prediction on `image` and returns either the model's output either the boxes (if `get_boxes = True`)
             
             Arguments :
-                - image : tf.Tensor of rank 3 or 4 (single / batched image(s))
+                - inputs    : `Tensor` of rank 3 or 4 (single / batched image(s))
                 - get_boxes : bool, whether to decode the model's output or not
                 - training  : whether to make prediction in training mode
                 - kwargs    : forwarded to `decode_output` if `get_boxes = True`
@@ -96,24 +74,14 @@ class BaseDetector(BaseImageModel):
                     list of boxes (where boxes is the list of BoundingBox for detected objects)
                 
         """
-        if not isinstance(image, tf.Tensor): image = tf.cast(image, tf.float32)
-        if len(image.shape) == 3:            image = tf.expand_dims(image, axis = 0)
+        inputs = ops.convert_to_tensor(inputs, 'float32')
+        if ops.rank(inputs) == 3:    inputs = inputs[None]
         
-        outputs = self(image, training = training)
-        
+        outputs = self(inputs, ** kwargs)
         if not get_boxes: return outputs
         
-        boxes = self.decode_output(outputs, ** kwargs)
+        boxes = self.decode_output(outputs, inputs = inputs, ** kwargs)
         return boxes if not return_output else zip(outputs, boxes)
-    
-    def encode_data(self, data):
-        return self.get_input(data), self.get_output(data)
-    
-    def augment_data(self, image, output):
-        return self.augment_input(image), output
-    
-    def preprocess_data(self, image, output):
-        return self.preprocess_input(image), output
     
     @timer(name = 'drawing')
     def draw_prediction(self, image, boxes, labels = None, as_mask = False, ** kwargs):
@@ -132,17 +100,19 @@ class BaseDetector(BaseImageModel):
     @timer
     def show_result(self, image, detected, boxes, verbose = 1, ** kwargs):
         if not verbose: return
-        if verbose > 1:
+        
+        _boxes = boxes if not isinstance(boxes, dict) else boxes['boxes']
+        if verbose > 1 and len(_boxes) > 0:
+            boxes = sort_boxes(boxes, method = 'top', ** kwargs)
+            _boxes = boxes if not isinstance(boxes, dict) else boxes['boxes']
             if verbose == 3:
                 logger.info("{} boxes found :\n{}".format(
-                    len(boxes), '\n'.join(str(b) for b in boxes)
+                    len(_boxes), '\n'.join(str(b) for b in _boxes)
                 ))
 
-            if len(boxes) > 0:
-                boxes = sort_boxes(_to_np(boxes), method = 'top', ** kwargs)
-                show_boxes(image, boxes, labels = kwargs.pop('labels', self.labels), ** kwargs)
+            show_boxes(image, boxes, labels = kwargs.pop('labels', self.labels), ** kwargs)
         # Show original image with drawed boxes
-        plot(detected, title = '{} object(s) detected'.format(len(boxes)), ** kwargs)
+        plot(detected, title = '{} object(s) detected'.format(len(_boxes)), ** kwargs)
 
     @timer
     def save_image(self, image, directory = None, filename = 'image_{}.jpg', ** kwargs):
@@ -221,7 +191,7 @@ class BaseDetector(BaseImageModel):
             kwargs.get('save_json_fn',    dump_json),
             kwargs.get('save_image_fn',   self.save_image),
             kwargs.get('save_detected_fn', self.save_detected),
-            kwargs.get('save_boxes_fn',   extract_boxes)
+            kwargs.get('save_boxes_fn',   None)
         ]
         
         if max_workers >= 0:
@@ -237,14 +207,14 @@ class BaseDetector(BaseImageModel):
         ]
     
     @timer
-    def stream(self, stream_name = 'stream_{}', save = False, max_workers = 0, ** kwargs):
+    def stream(self, stream_name = 'stream-{}', save = False, max_workers = 0, ** kwargs):
         """
             Performs streaming either on camera (default) or on filename (by specifying the `cam_id` kwarg)
         """
         kwargs.update({'save' : save})
         if stream_name:
             directory = kwargs.get('directory', self.stream_dir)
-            if '{}' in stream_name:
+            if '{' in stream_name:
                 stream_name = stream_name.format(len(
                     glob.glob(os.path.join(directory, stream_name.replace('{}', '*')))
                 ))
@@ -260,7 +230,7 @@ class BaseDetector(BaseImageModel):
         
         # for tensorflow-graph compilation (the 1st call is much slower than the next ones)
         input_size = [s if s is not None else 128 for s in self.input_size]
-        self.detect(tf.random.uniform(input_size))
+        self.detect(ops.zeros(input_size, dtype = 'float32'))
 
         saving_functions    = self._get_saving_functions(
             max_workers = max_workers, show_result_fn = None, save_json_fn = None
@@ -337,7 +307,7 @@ class BaseDetector(BaseImageModel):
                     - str   : the filename of the image
                     - dict / pd.Series  : informations about the image
                         - must contain at least `filename` or `embedding` or `image_embedding`
-                    - np.ndarray / tf.Tensor    : the embedding for the image
+                    - np.ndarray / `Tensor`    : the embedding for the image
                     
                     - list / pd.DataFrame   : an iterable of the above types
                 - batch_size    : the number of prediction to perform in parallel
@@ -412,10 +382,14 @@ class BaseDetector(BaseImageModel):
 
             now = time.time()
 
-            if isinstance(images, pd.DataFrame): images = images.to_dict('records')
-            if not isinstance(images, (list, tuple, np.ndarray, tf.Tensor)): images = [images]
-            elif isinstance(images, (np.ndarray, tf.Tensor)) and len(images.shape) == 3:
-                images = np.expand_dims(images, axis = 0)
+            if not isinstance(images, list):
+                if isinstance(images, pd.DataFrame):    images = images.to_dict('records')
+                elif isinstance(images, (str, dict)):   images = [images]
+                elif not ops.is_array(images):
+                    raise ValueError(
+                        'Unsupported `images` type : {}\n{}'.format(type(images), images)
+                    )
+                elif len(images.shape) == 3: images = images[None]
 
             if save_detected or save_boxes: save = True
             if display is None:         display = True if not save else False
@@ -486,13 +460,11 @@ class BaseDetector(BaseImageModel):
 
                     batch   = [self.get_input(image) for image in batch_images]
                     if len(batch) == 1:
-                        batch = tf.expand_dims(batch[0], axis = 0)
+                        batch = ops.expand_dims(batch[0], axis = 0)
                     elif self.has_variable_input_size:
-                        batch = tf.cast(pad_batch(batch, dtype = np.float32), tf.float32)
+                        batch = ops.cast(pad_batch(batch, dtype = 'float32'), 'float32')
                     else:
-                        batch = tf.stack(batch, axis = 0)
-
-                    batch = self.preprocess_input(batch)
+                        batch = ops.stack(batch, axis = 0)
 
                 # Computes detection + output decoding
                 boxes   = self.detect(
@@ -506,10 +478,10 @@ class BaseDetector(BaseImageModel):
                     infos = data if isinstance(data, dict) else {}
                     infos = {
                         k : v for k, v in infos.items()
-                        if 'image' not in k or not isinstance(v, (np.ndarray, tf.Tensor))
+                        if 'image' not in k or not ops.is_array(v)
                     }
                     if file is None:
-                        if isinstance(data, (np.ndarray, tf.Tensor)):
+                        if ops.is_array(data):
                             file = data
                         elif isinstance(data, (dict, pd.Series)) and 'image' in data:
                             file = data['image']
@@ -528,8 +500,8 @@ class BaseDetector(BaseImageModel):
                                     detected = data['image_copy']
                                 elif isinstance(file, np.ndarray):
                                     detected = image.copy() if save else file
-                                elif isinstance(file, tf.Tensor):
-                                    detected = file.numpy()
+                                elif ops.is_tensor(file):
+                                    detected = ops.convert_to_numpy(file)
                                 else:
                                     detected = image
 
@@ -843,13 +815,11 @@ class BaseDetector(BaseImageModel):
 
         return average_precisions
                                 
-    def get_config(self, * args, ** kwargs):
-        config = super(BaseDetector, self).get_config(* args, ** kwargs)
+    def get_config(self):
+        config = super(BaseDetector, self).get_config()
         config.update({
             ** self.get_config_image(),
-            'labels'    : self.labels,
-            'nb_class'  : self.nb_class,
-            
+            ** self.get_config_labels(),
             'obj_threshold' : self.obj_threshold,
             'nms_threshold' : self.nms_threshold
         })
@@ -861,8 +831,12 @@ def _get_image(file, data):
         if 'tf_image' in data:
             return data['tf_image']
         for k in ('image_copy', 'image', 'filename'):
-            if k in data: return load_image(data[k])
-    return load_image(file)
+            if k in data:
+                data = data[k]
+                break
+    if ops.is_array(data):
+        return data
+    return load_image(file, to_tensor = False, dtype = None, run_eagerly = True)
 
 @timer
 def post_process(results, idx, verbose, max_display, show_result_fn, post_processing_fn, ** kwargs):

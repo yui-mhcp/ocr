@@ -1,5 +1,5 @@
-# Copyright (C) 2022 yui-mhcp project's author. All rights reserved.
-# Licenced under the Affero GPL v3 Licence (the "Licence").
+# Copyright (C) 2022-now yui-mhcp project author. All rights reserved.
+# Licenced under a modified Affero GPL v3 Licence (the "Licence").
 # you may not use this file except in compliance with the License.
 # See the "LICENCE" file at the root of the directory for the licence information.
 #
@@ -10,15 +10,20 @@
 # limitations under the License.
 
 import os
+import keras
 import functools
 import collections
 import numpy as np
-import tensorflow as tf
+import keras.ops as K
 
-from utils.tensorflow_utils import tf_compile
-from custom_layers import get_activation, log_softmax, FasterEmbedding
-from custom_architectures.current_blocks import Conv2DBN
-from custom_architectures.generation_utils import infer
+from keras import layers
+
+from .current_blocks import Conv2DBN, set_cudnn_lstm
+from .generation_utils import infer
+from utils.keras_utils import TensorSpec, ops, graph_compile
+from custom_layers import get_activation, CustomRNNDropoutCell, CustomEmbedding
+
+_supports_cudnn_lstm    = False
 
 CRNNState = collections.namedtuple(
     'CRNNState', ['attention_state', 'main_attention']
@@ -215,47 +220,90 @@ _lang_groups    = {
     ]
 }
 
-class AttentionCell(tf.keras.layers.Layer):
+@keras.saving.register_keras_serializable('crnn')
+class GlobalAverage(keras.layers.Layer):
+    def call(self, inputs):
+        return K.mean(inputs, axis = -3)
+    
+@keras.saving.register_keras_serializable('crnn')
+class AttentionCell(keras.layers.Layer, CustomRNNDropoutCell):
     def __init__(self, hidden_size, drop_rate = 0.2, ** kwargs):
         super().__init__(** kwargs)
         self.drop_rate  = drop_rate
         self.hidden_size    = hidden_size
 
-        self.i2h    = tf.keras.layers.Dense(hidden_size, use_bias = False, name = 'i2h')
-        self.h2h    = tf.keras.layers.Dense(hidden_size, name = 'h2h')
-        self.score  = tf.keras.layers.Dense(1, use_bias = False, name = 'score')
-        self.rnn    = tf.keras.layers.LSTMCell(hidden_size, name = 'rnn')
-        self.dropout    = tf.keras.layers.Dropout(drop_rate)
-
-    def get_initial_state(self, * args, ** kwargs):
-        return self.rnn.get_initial_state(* args, ** kwargs)
-    
-    def call(self, inputs, encoder_output, prev_state, training = False, mask = None):
-        inputs_proj     = self.i2h(encoder_output)
-        inputs_proj     = self.dropout(inputs_proj, training = training)
-        prev_state_proj = tf.expand_dims(self.h2h(prev_state[0]), axis = 1)
-        prev_state_proj = self.dropout(prev_state_proj, training = training)
+        self.i2h    = layers.Dense(hidden_size, use_bias = False, name = 'i2h')
+        self.h2h    = layers.Dense(hidden_size, name = 'h2h')
+        self.score  = layers.Dense(1, use_bias = False, name = 'score')
+        self.rnn    = layers.LSTMCell(hidden_size, name = 'rnn')
+        self.memory_dropout = layers.Dropout(self.drop_rate)
         
-        energies        = self.score(tf.tanh(inputs_proj + prev_state_proj))
+        self.seed_generator = keras.random.SeedGenerator()
+
+    def build(self, input_shape):
+        super().build(input_shape)
+        inp_shape, enc_output_shape, state_shape = input_shape
+        
+        self.i2h.build(enc_output_shape)
+        self.h2h.build(state_shape)
+        self.score.build((None, self.hidden_size))
+        self.rnn.build((None, inp_shape[1] + self.hidden_size))
+        
+        self.dropout_shape = {
+            'state_proj'    : (1, self.hidden_size),
+            'output'    : (inp_shape[1] + self.hidden_size, )
+        }
+
+    @property
+    def rnn_cells(self):
+        return [(self.rnn, self.dropout_shape['output'])]
+    
+    def get_initial_state(self, batch_size):
+        return [self.rnn.get_initial_state(batch_size), K.zeros((batch_size, 1), dtype = 'int32')]
+    
+    def process_memory(self, encoder_output, training):
+        return self.memory_dropout(self.i2h(encoder_output), training = training)
+    
+    def call(self,
+             inputs,
+             encoder_output,
+             prev_state,
+             training   = False,
+             mask       = None,
+             encoder_output_proj    = None
+            ):
+        prev_state, step = prev_state
+        
+        if encoder_output_proj is None:
+            encoder_output_proj = self.process_memory(encoder_output)
+        
+        prev_state_proj = K.expand_dims(self.h2h(prev_state[0]), axis = 1)
+        prev_state_proj = self.dropout(
+            prev_state_proj, training = training, step = step, name = 'state_proj'
+        )
+        
+        energies        = self.score(K.tanh(encoder_output_proj + prev_state_proj))
         
         if mask is not None:
-            energies = tf.where(mask[:, :, tf.newaxis], energies, energies.dtype.min)
+            energies = K.where(mask[:, :, None], energies, K.cast(float('-inf'), energies.dtype))
         
-        attn_weights    = tf.nn.softmax(energies, axis = 1)
+        attn_weights    = K.softmax(energies, axis = 1)
         
-        context = tf.squeeze(tf.matmul(tf.transpose(attn_weights, [0, 2, 1]), encoder_output), 1)
-        concat_context  = tf.concat([context, inputs], axis = 1)
-        concat_context  = self.dropout(concat_context, training = training)
+        context = K.squeeze(K.matmul(K.transpose(attn_weights, [0, 2, 1]), encoder_output), 1)
+        concat_context  = K.concatenate([context, inputs], axis = 1)
+        concat_context  = self.dropout(
+            concat_context, training = training, step = step, name = 'output'
+        )
         
         _, new_state    = self.rnn(concat_context, prev_state)
-        return new_state, attn_weights
+        return new_state[0], [new_state, step + 1], attn_weights
     
     def get_config(self):
         return {
             ** super().get_config(), 'hidden_size' : self.hidden_size, 'drop_rate' : self.drop_rate
         }
 
-def BiLSTMSequenceModeling(input_shape  = (None, None, 512),
+def BiLSTMSequenceModeling(input_shape  = (None, 256),
                            input_tensor = None,
                            n_layers = 2,
                            units    = 256,
@@ -264,25 +312,32 @@ def BiLSTMSequenceModeling(input_shape  = (None, None, 512),
                           ):
     inputs  = input_tensor
     if input_tensor is None:
-        if not isinstance(input_shape, (list, tuple)): input_shape = (input_shape, input_shape, 3)
-        inputs  = tf.keras.layers.Input(shape = input_shape, name = 'input_image')
+        inputs  = layers.Input(shape = input_shape, name = 'input_sequence')
     
     x = inputs
     for i in range(n_layers):
-        x = tf.keras.layers.Bidirectional(
-            tf.keras.layers.LSTM(units, return_sequences = True), name = '{}/{}/rnn'.format(name, i)
-        )(x)
-        x = tf.keras.layers.Dense(units, name = '{}/{}/linear'.format(name, i))(x)
+        bidirectional = layers.Bidirectional(
+            layers.LSTM(units, return_sequences = True, name = 'rnn'.format(name, i)),
+            name = '{}-{}'.format(name, i)
+        )
+        set_cudnn_lstm(bidirectional)
+        
+        x = bidirectional(x)
+        x = layers.Dense(units, name = '{}-{}-linear'.format(name, i))(x)
 
-    return x if input_tensor is not None else tf.keras.Model(inputs, x, name = name)
+    return x if input_tensor is not None else keras.Model(inputs, x, name = name)
 
 def BasicBlock(x, n_blocks, channels, name, activation = 'relu', ** kwargs):
     residual = None
     if channels != x.shape[-1]:
         residual    = Conv2DBN(
-            x, channels, kernel_size = 1, use_bias = False, bnorm = 'after',
-            name    = '{}/0/downsample/conv'.format(name),
-            bn_name = '{}/0/downsample/bn'.format(name),
+            x,
+            channels,
+            kernel_size = 1,
+            use_bias    = False,
+            bnorm   = 'after',
+            name    = '{}-0-downsample-conv'.format(name),
+            bn_name = '{}-0-downsample-bn'.format(name),
             ** kwargs
         )
     
@@ -302,8 +357,8 @@ def BasicBlock(x, n_blocks, channels, name, activation = 'relu', ** kwargs):
             residual    = True if residual is not None and i == 0 else False,
             residual_tensor = residual,
 
-            name    = '{}/{}'.format(name, i) + '/conv{}',
-            bn_name = '{}/{}'.format(name, i) + '/bn{}',
+            name    = '{}-{}'.format(name, i) + '-conv{}',
+            bn_name = '{}-{}'.format(name, i) + '-bn{}',
             ** kwargs
         )
     
@@ -328,24 +383,24 @@ def ResNetBackbone(input_shape     = (None, None, 1),
     inputs  = input_tensor
     if input_tensor is None:
         if not isinstance(input_shape, (list, tuple)): input_shape = (input_shape, input_shape, 3)
-        inputs  = tf.keras.layers.Input(shape = input_shape, name = 'input_image')
+        inputs  = layers.Input(shape = input_shape, name = 'input_image')
     
     x = inputs
     for i, (n_blocks, channels, k, s) in enumerate(zip(blocks, channels, kernel_size, strides)):
         if isinstance(s, (list, tuple)) and i not in (0, 4):
-            x = tf.keras.layers.ZeroPadding2D(((0, 0), (1, 1)))(x)
+            x = layers.ZeroPadding2D(((0, 0), (1, 1)))(x)
         
         if i not in (0, 4):
-            name_format, bn_name_format = '{name}/conv{i}', '{name}/bn{i}'
-            x = tf.keras.layers.MaxPooling2D(pool_size = 2, strides = s)(x)
+            name_format, bn_name_format = '{name}-conv{i}', '{name}-bn{i}'
+            x = layers.MaxPooling2D(pool_size = 2, strides = s)(x)
         else:
-            name_format, bn_name_format = '{name}/conv{i}_{j}', '{name}/bn{i}_{j}'
+            name_format, bn_name_format = '{name}-conv{i}_{j}', '{name}-bn{i}_{j}'
         
         if n_blocks:
-            x = BasicBlock(x, n_blocks, channels, name = '{}/layer{}'.format(name, i))
+            x = BasicBlock(x, n_blocks, channels, name = '{}-layer{}'.format(name, i))
         
         if isinstance(s, (list, tuple)) and i in (0, 4):
-            x = tf.keras.layers.ZeroPadding2D(((0, 0), (1, 1)))(x)
+            x = layers.ZeroPadding2D(((0, 0), (1, 1)))(x)
 
         for j in range(2 if i in (0, 4) else 1):
             x = Conv2DBN(
@@ -367,12 +422,12 @@ def ResNetBackbone(input_shape     = (None, None, 1),
                 bn_name = bn_name_format.format(name = name, i = i, j = j + 1)
             )
 
-    return x if input_tensor is not None else tf.keras.Model(inputs, x, name = name)
+    return x if input_tensor is not None else keras.Model(inputs, x, name = name)
 
 def VGGBackbone(input_shape     = (None, None, 1),
                 input_tensor    = None,
                 
-                layers  = _default_vgg_layers,
+                _layers = _default_vgg_layers,
                 activation  = 'relu',
                 
                 norm_type   = 'batch',
@@ -385,17 +440,17 @@ def VGGBackbone(input_shape     = (None, None, 1),
     inputs  = input_tensor
     if input_tensor is None:
         if not isinstance(input_shape, (list, tuple)): input_shape = (input_shape, input_shape, 3)
-        inputs  = tf.keras.layers.Input(shape = input_shape, name = 'input_image')
+        inputs  = layers.Input(shape = input_shape, name = 'input_image')
     
     x = inputs
     l_idx   = 0
-    for i, l in enumerate(layers):
+    for i, l in enumerate(_layers):
         if not isinstance(l, tuple): l = (l, )
         
         if l[0] == 'M':
-            x = tf.keras.layers.MaxPooling2D(l[1] if len(l) > 1 else 2)(x)
+            x = layers.MaxPooling2D(l[1] if len(l) > 1 else 2)(x)
         elif l[0] == 'B':
-            x = tf.keras.layers.BatchNormalization(
+            x = layers.BatchNormalization(
                 epsilon = epsilon, momentum = momentum, name = 'norm_{}'.format(l_idx)
             )(x)
             x = get_activation(activation)(x)
@@ -403,23 +458,23 @@ def VGGBackbone(input_shape     = (None, None, 1),
         else:
             if len(l) == 1 or l[1] > 2:
                 k_half = 1 if len(l) == 1 else l[1] // 2
-                x = tf.keras.layers.ZeroPadding2D(
+                x = layers.ZeroPadding2D(
                     ((k_half, k_half), (k_half, k_half))
                 )(x)
-            x = tf.keras.layers.Conv2D(
+            x = layers.Conv2D(
                 filters     = l[0],
                 kernel_size = l[1] if len(l) > 1 else 3,
                 use_bias    = l[2] if len(l) > 2 else True,
                 padding     = 'valid',
                 name        = 'conv_{}'.format(l_idx)
             )(x)
-            if i == len(layers) - 1 or layers[i + 1] != 'B':
+            if i == len(_layers) - 1 or _layers[i + 1] != 'B':
                 l_idx += 1
                 x = get_activation(activation)(x)
     
         l_idx += 1
     
-    return x if input_tensor is not None else tf.keras.Model(inputs, x, name = name)
+    return x if input_tensor is not None else keras.Model(inputs, x, name = name)
 
 def CRNNCTC(input_shape    = None,
             vocab_size     = None,
@@ -442,26 +497,28 @@ def CRNNCTC(input_shape    = None,
         pretrained, infos = load_easyocr_crnn(pretrained, pretrained_lang)
         if not vocab_size: vocab_size  = len(infos['characters']) + 1
         
-    inputs      = tf.keras.layers.Input(shape = input_shape, name = 'input_image')
+    inputs      = layers.Input(shape = input_shape, name = 'input_image')
     
     if backbone.lower() == 'vgg':
         features    = VGGBackbone(input_tensor = inputs, ** kwargs)
     elif backbone.lower() == 'resnet':
         features    = ResNetBackbone(input_tensor = inputs, ** kwargs)
     
-    x   = tf.keras.layers.Lambda(lambda x: tf.reduce_mean(x, axis = -3))(features)
+    x   = GlobalAverage()(features)
     if sequence_modeling:
         if sequence_modeling.lower() in ('bilstm', 'bi_lstm'):
             x = BiLSTMSequenceModeling(
-                input_tensor = x, n_layers = n_lstm, units = lstm_size,
-                name = '{}/sequence_modeling'.format(name)
+                input_tensor = x,
+                n_layers = n_lstm,
+                units = lstm_size,
+                name = '{}-sequence_modeling'.format(name)
             )
     
     if prediction:
         if prediction.lower() in ('dense', 'ctc'):
-            x = tf.keras.layers.Dense(vocab_size, name = 'prediction')(x)
+            x = layers.Dense(vocab_size, name = 'prediction')(x)
     
-    model = tf.keras.Model(inputs, x, name = name)
+    model = keras.Model(inputs, x, name = name)
     
     if pretrained is not None:
         from models.weights_converter import name_based_partial_transfer_learning
@@ -469,11 +526,11 @@ def CRNNCTC(input_shape    = None,
         name_based_partial_transfer_learning(model, pretrained)
     
     if not include_top:
-        return tf.keras.Model(inputs, x, name = name), model.layers[-1]
+        return keras.Model(inputs, x, name = name), model.layers[-1]
     
     return model
 
-class CRNNWithAttn(tf.keras.Model):
+class CRNNWithAttn(keras.Model):
     def __init__(self,
                  input_shape,
                  vocab_size,
@@ -492,40 +549,35 @@ class CRNNWithAttn(tf.keras.Model):
         
         self.encoder    = CRNNCTC(input_shape, prediction = None, ** kwargs)
         
-        self.embedding_layer    = FasterEmbedding(
+        self.embedding_layer    = CustomEmbedding(
             vocab_size, vocab_size, embeddings_initializer = self.one_hot_initializer,
             name = 'embeddings'
         )
         self.attn_cell  = AttentionCell(hidden_size = attention_dim, name = 'attention_cell')
-        self.decoder    = tf.keras.layers.Dense(vocab_size, name = 'generator')
+        self.decoder    = layers.Dense(vocab_size, name = 'generator')
         
         self.sos_token  = kwargs.pop('sos_token', -1)
         self.eos_token  = kwargs.pop('eos_token', -1)
         self.pad_token  = kwargs.pop('pad_token', -1)
-    
-    def token_setter(self, name, val):
-        setattr(self, '_' + name, tf.constant(val, dtype = tf.int32, name = name))
-    
-    sos_token   = property(
-        lambda self: self._sos_token, lambda self, val: self.token_setter('sos_token', val)
-    )
-    eos_token   = property(
-        lambda self: self._eos_token, lambda self, val: self.token_setter('eos_token', val)
-    )
-    pad_token   = property(
-        lambda self: self._pad_token, lambda self, val: self.token_setter('pad_token', val)
-    )
+        
+        self.build((self.encoder.inputs[0].shape, (None, None)))
 
-    def _build(self):
-        inp_shape = tuple(s if s is not None else 64 for s in self.inp_shape)
-        return self([
-            tf.random.normal((1, ) + inp_shape), tf.range(5)[tf.newaxis]
-        ])
+    def build(self, input_shape):
+        super().build(input_shape)
+        self.encoder.build(input_shape[0])
+        
+        self.embedding_layer.build(input_shape[1])
+        self.attn_cell.build((
+            (None, self.vocab_size),
+            self.encoder.outputs[0].shape,
+            (None, self.attn_cell.hidden_size)
+        ))
+        self.decoder.build((None, None, self.attention_dim))
 
     @property
     def skip_layers(self):
-        return ['embeddings', 'sos_token', 'eos_token', 'pad_token']
-    
+        return ['embeddings']
+
     def change_vocabulary(self, vocab, ** kwargs):
         self.vocab_size = len(vocab)
         self.embedding_layer.change_vocabulary(vocab, ** kwargs)
@@ -536,14 +588,19 @@ class CRNNWithAttn(tf.keras.Model):
         if pad_token not in (-1, None): self.pad_token = pad_token
     
     def one_hot_initializer(self, shape, dtype):
-        return tf.eye(shape[0], dtype = dtype)
+        return K.eye(shape[0], dtype = dtype)
+
+    def build_padding_mask(self, y_true):
+        if self.eos_token != self.pad_token: return K.not_equal(y_true, self.pad_token)
+        lengths = K.count_nonzero(K.not_equal(y_true, self.pad_token), axis = 1) + 1
+        return K.arange(K.shape(y_true)[1])[None] < lengths
 
     def get_initial_state(self, batch_size = None, dtype = None):
         return CRNNState(
             attention_state = self.attn_cell.get_initial_state(
-                batch_size = batch_size, dtype = dtype
+                batch_size = batch_size
             ),
-            main_attention  = tf.zeros((batch_size, ), dtype = tf.int32)
+            main_attention  = K.zeros((batch_size, ), dtype = 'int32')
         )
 
     def get_output_shape(self, inputs, encoder_output, ** kwargs):
@@ -563,33 +620,45 @@ class CRNNWithAttn(tf.keras.Model):
     def call(self, inputs, training = False):
         enc_inputs, dec_inputs = inputs
         
+        batch_size  = K.shape(enc_inputs)[0]
+        
         encoded = self.encoder(enc_inputs, training = training)
         
-        state   = self.attn_cell.get_initial_state(
-            batch_size = tf.shape(encoded)[0], dtype = encoded.dtype
-        )
-        embeddings  = self.embedding_layer(dec_inputs)
+        encoded_proj = self.attn_cell.process_memory(encoded, training = training)
         
-        dec_output = tf.TensorArray(
-            size = tf.shape(dec_inputs)[1], dynamic_size = False, dtype = encoded.dtype
-        )
-        for i in tf.range(tf.shape(dec_inputs)[1]):
-            state, attn_weights = self.attn_cell(
-                embeddings[:, i], encoded, state, training = training
+        def step(inputs, state):
+            output, state, _ = self.attn_cell(
+                inputs,
+                encoded,
+                state,
+                mask    = getattr(encoded, '_keras_mask', None),
+                training    = training,
+                encoder_output_proj = encoded_proj
             )
             
-            if self.pad_token != -1:
-                state = tf.nest.map_structure(
-                    lambda s: s * tf.cast(dec_inputs[:, i : i + 1] != self.pad_token, s.dtype),
-                    state
-                )
-            
-            dec_output = dec_output.write(i, state[0])
+            return output, state
         
-        dec_output = tf.transpose(dec_output.stack(), [1, 0, 2])
-        logits = self.decoder(dec_output)
+        embeddings  = self.embedding_layer(dec_inputs)
 
-        return logits
+        mask    = self.build_padding_mask(dec_inputs)[:, :, None] if self.pad_token != -1 else None
+        state   = self.attn_cell.get_initial_state(batch_size = batch_size)
+        
+        self.attn_cell.init_dropout_mask(embeddings, state, training = training)
+        
+        _, dec_output, _ = keras.src.backend.rnn(
+            step,
+            inputs  = embeddings,
+            initial_states  = state,
+            zero_output_for_mask    = False,
+            return_all_outputs  = True,
+            time_major  = False
+        )
+        if mask is not None:
+            dec_output = K.where(mask, dec_output, 0.)
+        
+        self.attn_cell.reset_dropout_mask()
+
+        return self.decoder(dec_output)
 
     def step(self,
              inputs,
@@ -604,50 +673,51 @@ class CRNNWithAttn(tf.keras.Model):
              ** kwargs
             ):
         if initial_state is None:
-            initial_state = self.get_initial_state(tf.shape(inputs)[0], self.compute_dtype)
+            initial_state = self.get_initial_state(K.shape(inputs)[0], self.compute_dtype)
         
-        if len(tf.shape(inputs)) == 2: inputs = tf.squeeze(inputs, axis = 1)
-        inputs = tf.ensure_shape(inputs, (None, ))
+        if len(K.shape(inputs)) == 2: inputs = K.squeeze(inputs, axis = 1)
         
         embeddings = self.embedding_layer(inputs)
         
-        encoder_len = tf.shape(encoder_output)[1]
-        if attn_mask_win_len > 0:
-            center = tf.maximum(attn_mask_offset, initial_state.main_attention)
-            center = tf.minimum(center, encoder_len - attn_mask_win_len + attn_mask_offset)
-            center = tf.expand_dims(center, axis = 1)
+        encoder_len = K.shape(encoder_output)[1]
+        if attn_mask_win_len is not None:
+            center = K.maximum(attn_mask_offset, initial_state.main_attention)
+            center = K.minimum(center, encoder_len - attn_mask_win_len + attn_mask_offset)
+            center = K.expand_dims(center, axis = 1)
             
-            attn_mask   = tf.expand_dims(tf.range(encoder_len), axis = 0)
-            attn_mask   = tf.logical_and(
+            attn_mask   = K.expand_dims(K.arange(encoder_len), axis = 0)
+            attn_mask   = K.logical_and(
                 center - attn_mask_offset <= attn_mask,
                 attn_mask <= center + attn_mask_win_len - attn_mask_offset
             )
         else:
-            attn_mask = tf.fill((1, encoder_len), True)
+            attn_mask = K.ones((1, encoder_len), dtype = 'bool')
 
-        state, attn = self.attn_cell(
+        out, state, attn = self.attn_cell(
             embeddings,
             encoder_output,
             initial_state.attention_state,
             training    = training,
             mask    = attn_mask
         )
-        attn = attn[:, :, 0]
+        attn = K.squeeze(attn, axis = 2)
         
-        main_attention = tf.maximum(
-            tf.argmax(attn, axis = -1, output_type = tf.int32), initial_state.main_attention + 1
+        main_attention = K.maximum(
+            K.argmax(attn, axis = -1), initial_state.main_attention + 1
         )
         
-        logit   = self.decoder(state[0])
+        logit   = self.decoder(out)
 
-        finish_mask = main_attention > encoder_len
-        if tf.reduce_any(finish_mask):
-            if debug:
-                tf.print('Attention :', main_attention, '- length :', encoder_len, '- next token :', tf.argmax(logit, axis = -1))
-            eos_mask    = tf.tensor_scatter_nd_update(
-                tf.fill((1, self.vocab_size), logit.dtype.min), [[0, self.eos_token]], [0.]
+        if self.eos_token != -1:
+            logit = K.where(
+                K.expand_dims(main_attention >= encoder_len, axis = 1),
+                K.scatter_update(
+                    K.full((1, self.vocab_size), float('-inf'), dtype = logit.dtype),
+                    [[0, self.eos_token]],
+                    [0.]
+                ),
+                logit
             )
-            logits = tf.where(finish_mask[:, tf.newaxis], eos_mask, logit)
 
         return CRNNStep(
             output = logit,
@@ -655,139 +725,42 @@ class CRNNWithAttn(tf.keras.Model):
             attention_weights = attn
         )
 
-    #@tf.function(reduce_retracing = True)
-    @tf_compile(
-        reduce_retracing = True, support_xla = True, follow_type_hints = True, cast_kwargs = True
-    )
+    @graph_compile(prefer_xla = True)
     def infer(self,
-              inputs : tf.Tensor,
+              inputs : TensorSpec(dtype = 'float'),
               training      = False,
-              max_length    : tf.Tensor= 512,
               
-              attn_mask_offset  : tf.Tensor = 5,
-              attn_mask_win_len : tf.Tensor = 16,
+              max_length    : TensorSpec(shape = (), dtype = 'int32', static = True)    = 512,
+              attn_mask_offset  : TensorSpec(shape = (), dtype = 'int32', static = True)    = 5,
+              attn_mask_win_len : TensorSpec(shape = (), dtype = 'int32', static = True)    = 16,
+              
               ** kwargs
              ):
+        memory = self.encoder(inputs, training = training)
         return infer(
             self,
-            encoder_output = self.encoder(inputs, training = training),
+            encoder_output = memory,
 
             max_length        = max_length,
             attn_mask_offset  = attn_mask_offset,
             attn_mask_win_len = attn_mask_win_len,
             
             step_fn     = self.step,
-            sos_token   = self.sos_token,
-            eos_token   = self.eos_token,
-            pad_token   = self.pad_token,
-            vocab_size  = self.vocab_size,
             
             use_cache   = True,
+            is_transformer  = False,
             
             ** kwargs
-        )
-        
-
-    def infer_old(self,
-              inputs,
-              tokens    = None,
-              training  = False,
-              max_length    = 512,
-              
-              attn_mask_offset  = 5,
-              attn_mask_win_len = 16,
-              debug = False
-             ):
-        batch_size = tf.shape(inputs)[0]
-        
-        encoded = self.encoder(inputs, training = training)
-        encoder_len = tf.shape(encoded)[1]
-        
-        state   = self.attn_cell.get_initial_state(
-            batch_size = batch_size, dtype = encoded.dtype
-        )
-        
-        finished    = tf.zeros((batch_size, ), dtype = tf.bool)
-        lengths = tf.zeros((batch_size, ), dtype = tf.int32)
-        tokens  = tf.TensorArray(
-            size = max_length, dynamic_size = False, dtype = tf.int32
-        )
-        logits  = tf.TensorArray(
-            size = max_length, dynamic_size = False, dtype = tf.float32
-        )
-        attn_weights  = tf.TensorArray(
-            size = max_length, dynamic_size = False, dtype = tf.float32
-        )
-        token   = tf.fill((tf.shape(encoded)[0], ), self.sos_token)
-
-        win_half = attn_mask_win_len // 2
-        last_main_attention = tf.zeros((batch_size, ), dtype = tf.int32)
-        for t in tf.range(max_length):
-            embedded_token = self.embedding_layer(token)
-            
-            
-            if attn_mask_win_len > 0:
-                center = tf.maximum(attn_mask_offset, last_main_attention)
-                center = tf.minimum(center, encoder_len - attn_mask_win_len + attn_mask_offset)
-
-                attn_mask   = tf.expand_dims(tf.range(encoder_len), axis = 0)
-                attn_mask   = tf.logical_and(
-                    center - attn_mask_offset <= attn_mask,
-                    attn_mask <= center + attn_mask_win_len - attn_mask_offset
-                )
-            else:
-                attn_mask = tf.fill((1, encoder_len), True)
-
-            if debug:
-                print('Iter #{} : shape : {} - main attention : {}'.format(
-                    t, encoded.shape, last_main_attention
-                ))
-            state, attn = self.attn_cell(
-                embedded_token, encoded, state, training = training, mask = attn_mask
-            )
-            
-            last_main_attention = tf.maximum(
-                tf.argmax(attn[:, :, 0], axis = -1, output_type = tf.int32),
-                last_main_attention + 1
-            )
-            
-            logit   = self.decoder(state[0])
-            token   = tf.argmax(logit, axis = -1, output_type = tf.int32)
-            
-            if self.eos_token != -1:
-                finished = tf.logical_or(finished, token == self.eos_token)
-            
-                if self.pad_token != -1:
-                    token = tf.where(finished, self.pad_token, token)
-            
-            finished    = tf.logical_or(finished, last_main_attention >= encoder_len)
-            
-            logits  = logits.write(t, logit)
-            tokens  = tokens.write(t, token)
-            lengths = tf.where(finished, lengths, lengths + 1)
-            attn_weights = attn_weights.write(t, tf.squeeze(attn, axis = -1))
-            
-            if tf.reduce_all(finished): break
-
-        length = tf.reduce_max(lengths)
-        tokens = tf.transpose(tokens.stack(), [1, 0])[:, : length]
-        logits = tf.transpose(logits.stack(), [1, 0, 2])[:, : length]
-        return CRNNOutput(
-            tokens  = tokens,
-            lengths = lengths,
-            scores  = tf.reduce_sum(tf.gather(log_softmax(logits), tokens[:, :, tf.newaxis], batch_dims = 2)[:, :, 0], axis = -1),
-            logits  = logits,
-            attention_weights = tf.transpose(attn_weights.stack(), [1, 0, 2])[:, : length]
         )
 
     def get_config(self):
         return {
             'input_shape'   : self.inp_shape,
-            'vocab_size'    : self.vocab_size,
+            'vocab_size'    : int(self.vocab_size),
             'attention_dim' : self.attention_dim,
-            'sos_token'     : int(self.sos_token.numpy()),
-            'eos_token'     : int(self.eos_token.numpy()),
-            'pad_token'     : int(self.pad_token.numpy()),
+            'sos_token'     : self.sos_token,
+            'eos_token'     : self.eos_token,
+            'pad_token'     : self.pad_token,
             ** {k : v for k, v in self.kwargs}
         }
     
@@ -797,10 +770,10 @@ class CRNNWithAttn(tf.keras.Model):
 
     
 @functools.wraps(CRNNCTC)
-def CRNN(* args, ** kwargs):
-    if kwargs.get('prediction', 'ctc').lower() == 'attn':
+def CRNN(* args, prediction = 'ctc', ** kwargs):
+    if prediction in ('attention', 'attn'):
         return CRNNWithAttn(* args, ** kwargs)
-    return CRNNCTC(* args, ** kwargs)
+    return CRNNCTC(* args, prediction = prediction, ** kwargs)
 
 def get_easyocr_crnn_infos(model = None, lang = 'english', gen = 2):
     if model is None:
@@ -817,31 +790,18 @@ def load_easyocr_crnn(model = None, lang = 'english', gen = 2):
     import zipfile
     
     from utils import download_file
-    from models import _pretrained_models_folder
+    from models import get_pretrained_weights_dir
     
     model, infos = get_easyocr_crnn_infos(model = model, lang = lang, gen = gen)
     
-    zip_path    = os.path.join(_pretrained_models_folder, 'pretrained_weights', 'temp.zip')
-    model_path  = os.path.join(_pretrained_models_folder, 'pretrained_weights', infos['filename'])
+    zip_path    = os.path.join(get_pretrained_weights_dir(), 'temp.zip')
+    model_path  = os.path.join(get_pretrained_weights_dir(), infos['filename'])
     
     if not os.path.exists(model_path):
         zip_file = download_file(infos['url'], zip_path)
         with zipfile.ZipFile(zip_file, 'r') as file:
-            file.extract(
-                infos['filename'], os.path.join(_pretrained_models_folder, 'pretrained_weights')
-            )
+            file.extract(infos['filename'], get_pretrained_weights_dir())
         os.remove(zip_file)
     
     return torch.load(model_path, map_location = 'cpu'), infos
     
-custom_functions    = {
-    'CRNN'  : CRNN,
-    'CRNNCTC'   : CRNNCTC,
-    'CRNNWithAttn'  : CRNNWithAttn
-}
-
-custom_objects  = {
-    'FasterEmbedding'   : FasterEmbedding,
-    'AttentionCell' : AttentionCell,
-    'CRNNWithAttn'  : CRNNWithAttn
-}

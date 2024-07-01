@@ -1,5 +1,5 @@
-# Copyright (C) 2022-now yui-mhcp project's author. All rights reserved.
-# Licenced under the Affero GPL v3 Licence (the "Licence").
+# Copyright (C) 2022-now yui-mhcp project author. All rights reserved.
+# Licenced under a modified Affero GPL v3 Licence (the "Licence").
 # you may not use this file except in compliance with the License.
 # See the "LICENCE" file at the root of the directory for the licence information.
 #
@@ -12,14 +12,13 @@
 import os
 import logging
 import numpy as np
-import tensorflow as tf
 
-from loggers import timer, time_logger
 from utils import download_file
-from utils.image.box_utils import *
-from utils.distance.distance_method import iou
+from loggers import timer, time_logger
+from utils.keras_utils import TensorSpec, execute_eagerly
+from utils.image.bounding_box import *
+from .base_detector import BaseDetector
 from custom_architectures import get_architecture
-from models.detection.base_detector import BaseDetector
 
 logger      = logging.getLogger(__name__)
 
@@ -39,6 +38,8 @@ VOC_CONFIG  = {
 }
 
 class YOLO(BaseDetector):
+    _default_loss   = 'YoloLoss'
+    
     def __init__(self,
                  * args,
                  max_box_per_image  = 100,
@@ -56,34 +57,31 @@ class YOLO(BaseDetector):
         self.backend    = backend
         self.anchors    = anchors
         self.max_box_per_image = max_box_per_image
-        
-        self.np_anchors = np.reshape(np.array(anchors), [self.nb_box, 2])
 
+        self.np_anchors = np.array(anchors).reshape(-1, 2)
+        
         super().__init__(* args, input_size = input_size, nb_class = nb_class, ** kwargs)
-
-    def init_train_config(self, * args, ** kwargs):
-        super().init_train_config(* args, ** kwargs)
-        
-        if hasattr(self, 'model_loss'):
-            self.model_loss.seen = self.current_epoch
             
-    def _build_model(self, flatten = True, randomize = True, ** kwargs):
-        feature_extractor = get_architecture(
-            architecture_name = self.backend,
-            input_shape = self.input_size,
-            include_top = False,
-            ** kwargs
-        )
+    def build(self, flatten = True, randomize = False, model = None, ** kwargs):
+        if model is None:
+            feature_extractor = get_architecture(
+                architecture    = self.backend,
+                input_shape     = self.input_size,
+                include_top     = False,
+                ** kwargs
+            )
+
+            model = {
+                'architecture'  : 'yolo',
+                'feature_extractor' : feature_extractor,
+                'input_shape'   : self.input_size,
+                'anchors'   : self.anchors,
+                'nb_class'  : self.nb_class,
+                'flatten'   : flatten,
+                'randomize' : randomize
+            }
         
-        super()._build_model(model = {
-            'architecture_name' : 'yolo',
-            'feature_extractor' : feature_extractor,
-            'input_shape'       : self.input_size,
-            'nb_class'      : self.nb_class,
-            'nb_box'        : self.nb_box,
-            'flatten'       : flatten,
-            'randomize'     : randomize
-        })
+        return super().build(model = model)
     
     @property
     def grid_h(self):
@@ -96,12 +94,12 @@ class YOLO(BaseDetector):
     @property
     def output_signature(self):
         return (
-            tf.TensorSpec(
+            TensorSpec(
                 shape = (None, self.grid_h, self.grid_w, self.nb_box, 5 + self.nb_class),
-                dtype = tf.float32
+                dtype = 'float32'
             ),
-            tf.TensorSpec(
-                shape = (None, 1, 1, 1, self.max_box_per_image, 4), dtype = tf.float32
+            TensorSpec(
+                shape = (None, 1, 1, 1, self.max_box_per_image, 4), dtype = 'float32'
             )
         )
     
@@ -114,101 +112,20 @@ class YOLO(BaseDetector):
         des += "- Feature extractor : {}\n".format(self.backend)
         return des
     
-    def compile(self, loss = 'YoloLoss', loss_config = {}, ** kwargs):
-        loss_config.update({'anchors' : self.anchors})
-        
-        super().compile(loss = loss, loss_config = loss_config, ** kwargs)
-    
-    @timer(name = 'output decoding')
     def decode_output(self, output, obj_threshold = None, nms_threshold = None, ** kwargs):
-        if len(output.shape) == 5:
-            return [self.decode_output(
-                out, obj_threshold = obj_threshold, nms_threshold = nms_threshold, ** kwargs
-            ) for out in output]
-        
         if obj_threshold is None: obj_threshold = self.obj_threshold
         if nms_threshold is None: nms_threshold = self.nms_threshold
         
-        with time_logger.timer('init'):
-            grid_h, grid_w, nb_box = output.shape[:3]
-            nb_class = output.shape[3] - 5
+        return decode_output(
+            output, obj_threshold = obj_threshold, nms_threshold = nms_threshold, ** kwargs
+        )
 
-            pos     = output[..., :4].numpy()
-            conf    = tf.sigmoid(output[..., 4:5]).numpy()
-            classes = tf.nn.softmax(output[..., 5:], axis = -1).numpy()
-
-        # decode the output by the network
-        
-        with time_logger.timer('preprocess'):
-            scores  = conf * classes
-            scores[scores <= obj_threshold] = 0.
-
-            class_scores = np.sum(scores, axis = -1)
-
-            conf    = conf[..., 0]
-            candidates  = np.where(class_scores > 0.)
-        
-        with time_logger.timer('box filtering'):
-            pos     = pos[candidates]
-            conf    = conf[candidates]
-            classes = classes[candidates]
-
-            row, col, box = candidates
-            x, y, w, h    = [pos[:, i] for i in range(4)]
-
-            np_anchors = np.array(self.anchors)
-
-            x = (col + _sigmoid(x)) / grid_w # center position, unit: image width
-            y = (row + _sigmoid(y)) / grid_h # center position, unit: image height
-            w = np_anchors[2 * box + 0] * np.exp(w) / grid_w # unit: image width
-            h = np_anchors[2 * box + 1] * np.exp(h) / grid_h # unit: image height
-
-            x1 = np.maximum(0., x - w / 2.)
-            y1 = np.maximum(0., y - h / 2.)
-            x2 = np.minimum(1., x + w / 2.)
-            y2 = np.minimum(1., y + h / 2.)
-
-            valids = np.logical_and(x1 < x2, y1 < y2)
-            boxes  = [BoundingBox(
-                x1 = float(x1i), y1 = float(y1i), x2 = float(x2i), y2 = float(y2i),
-                conf = c, classes = cl
-            ) for x1i, y1i, x2i, y2i, c, cl in zip(
-                x1[valids], y1[valids], x2[valids], y2[valids], conf[valids], classes[valids]
-            )]
-
-        # suppress non-maximal boxes
-        with time_logger.timer('NMS'):
-            ious = {}
-            for c in range(nb_class):
-                scores = np.array([box.classes[c] for box in boxes])
-                sorted_indices = np.argsort(scores)[::-1]
-                sorted_indices = sorted_indices[scores[sorted_indices] > 0]
-
-                for i, index_i in enumerate(sorted_indices):
-                    if boxes[index_i].classes[c] == 0: continue
-
-                    for j in range(i + 1, len(sorted_indices)):
-                        index_j = sorted_indices[j]
-                        if boxes[index_j].classes[c] == 0: continue
-
-                        if (index_i, index_j) not in ious:
-                            ious[(index_i, index_j)] = iou(
-                                boxes[index_i], boxes[index_j], box_mode = BoxFormat.OBJECT
-                            )
-
-                        if ious[(index_i, index_j)] >= nms_threshold:
-                            boxes[index_j].classes[c] = 0
-        
-        # remove the boxes which are less likely than a obj_threshold
-        boxes = [box for box in boxes if box.score > 0]
-        return boxes
-
-    def get_output_fn(self, boxes, labels, nb_box, image_h, image_w, ** kwargs):
-        if hasattr(boxes, 'numpy'): boxes = boxes.numpy()
-        if hasattr(image_h, 'numpy'): image_h, image_w = image_h.numpy(), image_w.numpy()
-        
-        output      = np.zeros((self.grid_h, self.grid_w, self.nb_box, 5 + self.nb_class))
-        true_boxes  = np.zeros((1, 1, 1, self.max_box_per_image, 4))
+    @execute_eagerly(Tout = ('float32', 'float32'), numpy = True)
+    def get_output(self, boxes, labels, nb_box, image_h, image_w, ** kwargs):
+        output      = np.zeros(
+            (self.grid_h, self.grid_w, self.nb_box, 5 + self.nb_class), dtype = np.float32
+        )
+        true_boxes  = np.zeros((self.max_box_per_image, 4), dtype = np.float32)
         
         logger.debug("Image with shape ({}, {}) and {} boxes :".format(image_h, image_w, len(boxes)))
         
@@ -231,7 +148,7 @@ class YOLO(BaseDetector):
                 box = np.array([center_x, center_y, w, h])
                 yolo_box = np.array([center_x, center_y, w, h, 1.])
                 
-                true_boxes[0, 0, 0, i % self.max_box_per_image, :] = box
+                true_boxes[i % self.max_box_per_image, :] = box
                 
                 # find the anchor that best predicts this box
                 
@@ -253,17 +170,18 @@ class YOLO(BaseDetector):
         
         return output, true_boxes
     
-    def get_output(self, infos):
-        output, true_boxes = tf.py_function(
-            self.get_output_fn,
-            [infos['box'], infos['label'], infos['nb_box'], infos['height'], infos['width']],
-            Tout = [tf.float32, tf.float32]
+    def prepare_output(self, infos, ** _):
+        return self.get_output(
+            infos['boxes'],
+            infos['label'],
+            infos['nb_box'],
+            infos['height'],
+            infos['width'],
+            shape = [
+                (self.grid_h, self.grid_w, self.nb_box, 5 + self.nb_class),
+                (self.max_box_per_image, 4)
+            ]
         )
-
-        output.set_shape([self.grid_h, self.grid_w, self.nb_box, 5 + self.nb_class])
-        true_boxes.set_shape([1, 1, 1, self.max_box_per_image, 4])
-        
-        return output, true_boxes
     
     def get_config(self, * args, ** kwargs):
         config = super().get_config(* args, ** kwargs)
@@ -279,7 +197,7 @@ class YOLO(BaseDetector):
     @classmethod
     def from_darknet_pretrained(cls,
                                 weight_path = 'yolov2.weights',
-                                nom     = 'coco_pretrained',
+                                name    = 'coco_pretrained',
                                 labels  = COCO_CONFIG['labels'],
                                 ** kwargs
                                ):
@@ -287,17 +205,67 @@ class YOLO(BaseDetector):
             weight_path = download_file(PRETRAINED_COCO_URL, filename = weight_path)
             
         instance = cls(
-            nom = nom, labels = labels, max_to_keep = 1, pretrained_name = weight_path, ** kwargs
+            name = name, labels = labels, max_to_keep = 1, pretrained_name = weight_path, ** kwargs
         )
         
-        decode_darknet_weights(instance.get_model(), weight_path)
+        decode_darknet_weights(instance.model, weight_path)
         
         instance.save()
         
         return instance
 
-def _sigmoid(x):
-    return 1. / (1. + np.exp(-x))
+@timer(name = 'output decoding')
+def decode_output(output, *, obj_threshold = 0.35, nms_threshold = 0.2, ** kwargs):
+    output = ops.convert_to_numpy(output)
+    
+    if len(output.shape) == 5:
+        kwargs.update({'obj_threshold' : obj_threshold, 'nms_threshold' : nms_threshold})
+        return [decode_output(out, ** kwargs) for out in output]
+    
+    with time_logger.timer('init'):
+        grid_h, grid_w, nb_box = output.shape[:3]
+        nb_class = output.shape[3] - 5
+        
+        scores  = output[..., 5:] * output[..., 4:5]
+
+    with time_logger.timer('box selection'):
+        candidates = np.where(np.max(scores, axis = -1) > obj_threshold)
+
+        pos    = output[..., :4][candidates]
+        pos    = pos / np.array([grid_w, grid_h, grid_w, grid_h], dtype = pos.dtype)
+        scores = scores[candidates]
+
+        xy_min = np.maximum(pos[:, :2] - pos[:, 2:] / 2., 0.)
+        xy_max = np.minimum(pos[:, :2] + pos[:, 2:] / 2., 1.)
+        
+        valids  = np.all(xy_max > xy_min, axis = 1)
+        boxes   = np.concatenate([xy_min[valids], xy_max[valids]], axis = 1)
+        classes = scores[valids]
+
+    # suppress non-maximal boxes
+    with time_logger.timer('NMS'):
+        ious = {}
+        for c in range(nb_class):
+            scores = classes[:, c]
+            sorted_indices = np.argsort(scores)[::-1]
+            sorted_indices = sorted_indices[scores[sorted_indices] > obj_threshold]
+
+            for i, index_i in enumerate(sorted_indices):
+                if classes[index_i, c] < obj_threshold: continue
+
+                for j in range(i + 1, len(sorted_indices)):
+                    index_j = sorted_indices[j]
+                    if classes[index_j, c] < obj_threshold: continue
+
+                    if (index_i, index_j) not in ious:
+                        ious[(index_i, index_j)] = compute_iou(
+                            boxes[index_i], boxes[index_j], source = 'xyxy'
+                        )
+
+                    if ious[(index_i, index_j)] >= nms_threshold:
+                        classes[index_j, c] = 0
+
+    return {'boxes' : boxes[np.max(classes, 1) > obj_threshold], 'format' : 'xyxy'}
 
 def decode_darknet_weights(model, wt_path):
     #Chargement des poids

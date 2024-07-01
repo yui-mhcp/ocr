@@ -1,6 +1,5 @@
-
-# Copyright (C) 2022 yui-mhcp project's author. All rights reserved.
-# Licenced under the Affero GPL v3 Licence (the "Licence").
+# Copyright (C) 2022-now yui-mhcp project author. All rights reserved.
+# Licenced under a modified Affero GPL v3 Licence (the "Licence").
 # you may not use this file except in compliance with the License.
 # See the "LICENCE" file at the root of the directory for the licence information.
 #
@@ -10,13 +9,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-""" TF 2.0 OpenAI GPT-2 model, compatible with the `transformers`' checkpoint."""
+import keras
 
-import tensorflow as tf
-
-from custom_architectures.transformers_arch.text_transformer_arch import (
-    TextTransformerEncoder, HParamsTextTransformerEncoder
-)
+from .text_transformer_arch import TextTransformerEncoder, HParamsTextTransformerEncoder
 
 HParamsBaseGPT2  = HParamsTextTransformerEncoder(
     use_causal_attention    = True,
@@ -33,6 +28,7 @@ HParamsBaseGPT2  = HParamsTextTransformerEncoder(
     ffn_activation  = 'gelu_new'
 )
 
+@keras.saving.register_keras_serializable('transformers')
 class BaseGPT2(TextTransformerEncoder):
     default_params  = HParamsBaseGPT2
 
@@ -57,9 +53,8 @@ class BaseGPT2(TextTransformerEncoder):
                         ** kwargs
                        ):
         if pretrained is None:
-            from transformers import TFGPT2Model
-            with tf.device('cpu'):
-                pretrained = TFGPT2Model.from_pretrained(pretrained_name)
+            from transformers import GPT2Model
+            pretrained = GPT2Model.from_pretrained(pretrained_name)
 
         if isinstance(pretrained, dict):
             pretrained  = {k : v for k, v in pretrained.items() if 'gpt' in k}
@@ -88,12 +83,13 @@ class BaseGPT2(TextTransformerEncoder):
             )
 
         instance = cls(** config(** kwargs))
-        instance._build()
+        instance.build((None, None))
 
         instance.transfer_weights(pretrained, ** kwargs)
 
         return instance
 
+@keras.saving.register_keras_serializable('transformers')
 class GPT2(BaseGPT2):
     @property
     def output_dim(self):
@@ -103,13 +99,3 @@ class GPT2(BaseGPT2):
         output = super().compute_output(output, training = training, mask = mask, ** kwargs)
 
         return self.embeddings.linear(output)
-
-custom_functions    = {
-    'BaseGPT2'      : BaseGPT2,
-    'GPT2'          : GPT2
-}
-
-custom_objects  = custom_functions
-
-_encoders   = {'GPT2' : GPT2}
-_transformers   = _encoders

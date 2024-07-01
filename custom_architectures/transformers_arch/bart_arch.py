@@ -1,6 +1,5 @@
-
-# Copyright (C) 2022 yui-mhcp project's author. All rights reserved.
-# Licenced under the Affero GPL v3 Licence (the "Licence").
+# Copyright (C) 2022-now yui-mhcp project author. All rights reserved.
+# Licenced under a modified Affero GPL v3 Licence (the "Licence").
 # you may not use this file except in compliance with the License.
 # See the "LICENCE" file at the root of the directory for the licence information.
 #
@@ -10,24 +9,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-""" TF 2.0 BART model, compatible with the `transformers`' model. """
-
-import tensorflow as tf
+import keras
 
 from tqdm import tqdm
 
-from loggers import timer
-from custom_layers import FasterEmbedding, get_activation
-from custom_architectures.transformers_arch.embedding_head import EmbeddingHead, HParamsEmbeddingHead
-from custom_architectures.transformers_arch.text_transformer_arch import *
+from custom_layers import CustomEmbedding, get_activation
+from .text_transformer_arch import *
 
 HParamsBartEncoder      = HParamsTextTransformerEncoder
-HParamsBartEmbedding    = HParamsBartEncoder(** HParamsEmbeddingHead)
 
 HParamsBartDecoder  = HParamsTextTransformerDecoder(
     final_activation    = 'softmax',
 )
 
+@keras.saving.register_keras_serializable('transformers')
 class BartEncoder(TextTransformerEncoder):
     default_params = HParamsBartEncoder
 
@@ -39,8 +34,7 @@ class BartEncoder(TextTransformerEncoder):
                         ** kwargs
                        ):
         if pretrained is None:
-            with tf.device('cpu') as d:
-                pretrained = transformers_bart(pretrained_name, pretrained_task)
+            pretrained = transformers_bart(pretrained_name, pretrained_task)
 
         config = cls.default_params(
             vocab_size      = pretrained.config.vocab_size,
@@ -49,7 +43,9 @@ class BartEncoder(TextTransformerEncoder):
             positional_offset   = 2,
             scale_embedding = False if not hasattr(pretrained.config, 'scale_embedding') else pretrained.config.scale_embedding,
             epsilon = 1e-5,
+            sos_token   = 0,
             pad_token   = 1,
+            eos_token   = 2,
 
             num_layers  = pretrained.config.encoder_layers,
             ffn_dim     = pretrained.config.encoder_ffn_dim,
@@ -58,25 +54,13 @@ class BartEncoder(TextTransformerEncoder):
         )
         
         instance = cls(** config(** kwargs))
-        instance._build()
+        instance.build((None, None))
 
         instance.transfer_weights(pretrained)
         
         return instance
 
-class BartEmbedding(BartEncoder):
-    default_params = HParamsBartEmbedding
-    
-    def __init__(self, output_dim, vocab_size, embedding_dim, ** kwargs):
-        super().__init__(
-            vocab_size = vocab_size, embedding_dim = embedding_dim, ** kwargs
-        )
-        
-        self.embedding_head = EmbeddingHead(** self.hparams)
-
-    def compute_output(self, output, training = False, mask = None, ** kwargs):
-        return self.embedding_head(output, mask = mask, training = training)
-
+@keras.saving.register_keras_serializable('transformers')
 class BartDecoder(TextTransformerDecoder):
     default_params = HParamsBartDecoder
     
@@ -86,16 +70,16 @@ class BartDecoder(TextTransformerDecoder):
             token_embedding = token_embedding, ** kwargs
         )
 
-        self.final_bias = self.add_weight(
-            shape = [1, vocab_size], name = "final_bias", trainable = False, initializer = "zeros"
-        )
         self.final_act_layer    = get_activation(self.hparams.final_activation)
     
-    def change_vocabulary(self, vocab, ** kwargs):
-        super().change_vocabulary(vocab, ** kwargs)
+    def build(self, input_shape):
+        super().build(input_shape)
         self.final_bias = self.add_weight(
             shape = [1, self.vocab_size], name = "final_bias", trainable = False, initializer = "zeros"
         )
+        
+    def change_vocabulary(self, vocab, ** kwargs):
+        raise NotImplementedError()
         
     @property
     def output_dim(self):
@@ -118,8 +102,7 @@ class BartDecoder(TextTransformerDecoder):
                         ** kwargs
                        ):
         if pretrained is None:
-            with tf.device('cpu') as d:
-                pretrained = transformers_bart(pretrained_name, pretrained_task)
+            pretrained = transformers_bart(pretrained_name, pretrained_task)
 
         config = cls.default_params(
             vocab_size      = pretrained.config.vocab_size,
@@ -140,19 +123,20 @@ class BartDecoder(TextTransformerDecoder):
         )
         
         instance = cls(** config(** kwargs))
-        instance._build()
+        instance.build((None, None))
         
         instance.transfer_weights(pretrained, tqdm = tqdm)
         
         return instance
 
+@keras.saving.register_keras_serializable('transformers')
 class Bart(TextTransformer):
     encoder_class   = BartEncoder
     decoder_class   = BartDecoder
     
     def __init__(self, vocab_size, embedding_dim, max_input_length,
                  ** kwargs):
-        shared_embedding = FasterEmbedding(
+        shared_embedding = CustomEmbedding(
             vocab_size, embedding_dim, name = "token_embedding"
         )
         super().__init__(
@@ -172,8 +156,7 @@ class Bart(TextTransformer):
                         ** kwargs
                        ):
         if pretrained is None:
-            with tf.device('cpu') as d:
-                pretrained = transformers_bart(pretrained_name, pretrained_task)
+            pretrained = transformers_bart(pretrained_name, pretrained_task)
 
         config = cls.default_params(
             vocab_size      = pretrained.config.vocab_size,
@@ -199,7 +182,7 @@ class Bart(TextTransformer):
         )
         
         instance = cls(** config(** kwargs))
-        instance._build()
+        instance.build(((None, None), (None, None)))
         
         instance.encoder.transfer_weights(pretrained, tqdm = tqdm)
         instance.decoder.transfer_weights(pretrained, tqdm = tqdm)
@@ -217,23 +200,3 @@ def transformers_bart(name = 'facebook/bart-large', task = 'generation'):
             tuple(_transformers_pretrained_task.keys()), task
         ))
 
-_bart_classes   = {
-    'BartEncoder'   : BartEncoder,
-    'BartEmbedding' : BartEmbedding,
-    'BartDecoder'   : BartDecoder,
-    'Bart'          : Bart
-}
-        
-custom_functions    = {
-    ** _bart_classes,
-    'transformers_bart' : transformers_bart
-}
-
-custom_objects  = {
-    ** _bart_classes,
-    'TransformerEncoder'    : TransformerEncoder
-}
-
-_encoders   = {'Bart' : BartEmbedding}
-_decoders   = {'Bart' : BartDecoder}
-_transformers   = {'Bart' : Bart}

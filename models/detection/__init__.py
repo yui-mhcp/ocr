@@ -1,6 +1,5 @@
-
-# Copyright (C) 2022 yui-mhcp project's author. All rights reserved.
-# Licenced under the Affero GPL v3 Licence (the "Licence").
+# Copyright (C) 2022-now yui-mhcp project author. All rights reserved.
+# Licenced under a modified Affero GPL v3 Licence (the "Licence").
 # you may not use this file except in compliance with the License.
 # See the "LICENCE" file at the root of the directory for the licence information.
 #
@@ -14,7 +13,7 @@ import logging
 
 from models.detection.yolo import YOLO
 from models.detection.east import EAST
-from models.model_utils import get_models, get_model_config, is_model_name
+from models.saving import get_models, get_model_config, is_model_name
 
 logger = logging.getLogger(__name__)
 

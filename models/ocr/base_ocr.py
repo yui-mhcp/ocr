@@ -1,5 +1,5 @@
-# Copyright (C) 2022-now yui-mhcp project's author. All rights reserved.
-# Licenced under the Affero GPL v3 Licence (the "Licence").
+# Copyright (C) 2022-now yui-mhcp project author. All rights reserved.
+# Licenced under a modified Affero GPL v3 Licence (the "Licence").
 # you may not use this file except in compliance with the License.
 # See the "LICENCE" file at the root of the directory for the licence information.
 #
@@ -15,37 +15,28 @@ import time
 import logging
 import numpy as np
 import pandas as pd
-import tensorflow as tf
 
 from loggers import timer, time_logger
+from utils.keras_utils import TensorSpec, ops
 from utils import plot, load_json, dump_json, get_filename, should_predict, pad_batch
 from utils.distance import dice_coeff, edit_distance
 from utils.text import build_masking_filter
 from utils.image import HTTPScreenMirror, save_image, load_image
-from utils.image.box_utils import *
+from utils.image.bounding_box import *
 from models.interfaces.base_text_model import BaseTextModel
 from models.interfaces.base_image_model import BaseImageModel
+from custom_architectures.current_blocks import set_cudnn_lstm
 
 logger  = logging.getLogger(__name__)
-
-DEFAULT_MAX_TEXT_LENGTH = 32
 
 class BaseOCR(BaseImageModel, BaseTextModel):
     output_signature    = BaseTextModel.text_signature
 
-    get_input   = BaseImageModel.get_image_with_box
-    get_output  = BaseTextModel.tf_encode_text
-    augment_input   = BaseImageModel.augment_image
-    preprocess_input    = BaseImageModel.preprocess_image
-    augment_original_data   = BaseImageModel.augment_box
+    augment_raw_data    = BaseImageModel.augment_box
+    prepare_input   = BaseImageModel.get_image_with_box
+    prepare_output  = BaseTextModel.encode_text
     
-    def __init__(self,
-                 lang   = 'multi',
-                 input_size = None,
-                 
-                 max_output_length = DEFAULT_MAX_TEXT_LENGTH,
-                 ** kwargs
-                ):
+    def __init__(self, lang = 'multi', input_size = None, max_output_length = None, ** kwargs):
         self._init_text(lang = lang, ** kwargs)
         self._init_image(input_size = input_size, ** kwargs)
         
@@ -53,7 +44,8 @@ class BaseOCR(BaseImageModel, BaseTextModel):
 
         super().__init__(** kwargs)
         
-        if hasattr(self.model, '_build'): self.model._build()
+        set_cudnn_lstm(self.model)
+                
         if hasattr(self.model, 'set_tokens'): self.model.set_tokens(** self.model_tokens)
     
     @property
@@ -65,41 +57,51 @@ class BaseOCR(BaseImageModel, BaseTextModel):
         if self.is_encoder_decoder:
             return (self.image_signature, self.text_signature)
         return self.image_signature
-    
-    @property
-    def default_image_augmentation(self):
-        augment_methods = [] if self.has_fixed_input_size else ['random_resize']
-        return super().default_image_augmentation + augment_methods
 
     @property
     def training_hparams(self):
-        image_hparams = self.training_hparams_image
-        return super().training_hparams(
-            ** image_hparams,
-            ** self.get_image_augmentation_config(image_hparams),
-            max_output_length   = None
-        )
-
+        return super().training_hparams(** self.training_hparams_image)
+    
+    @property
+    def default_loss_config(self):
+        return {
+            'pad_value'     : self.blank_token_idx,
+            'eos_value'     : self.eos_token_idx,
+            'from_logits'   : True
+        }
+    
+    @property
+    def default_metrics_config(self):
+        return self.default_loss_config
+    
     def __str__(self):
         return super().__str__() + self._str_image() + self._str_text()
     
     @timer(name = 'inference')
     def infer(self, inputs, training = False, ** kwargs):
+        if len(ops.shape(inputs)) == 3: inputs = inputs[None]
         if hasattr(self.model, 'infer'):
             kwargs.setdefault('max_length', self.max_output_length)
         
             return self.model.infer(inputs, training = training, ** kwargs)
-        if self.model.__class__.__name__ == 'Functional': kwargs = {}
         return self(inputs, training = training, ** kwargs)
     
+    def compile(self, loss = None, metrics = None, ** kwargs):
+        if not loss:
+            loss = 'TextLoss' if self.is_encoder_decoder else 'CTCLoss'
+        if not metrics:
+            metrics = ['TextAccuracy'] if self.is_encoder_decoder else []
+        
+        return super().compile(loss = loss, metrics = metrics, ** kwargs)
+
     def decode_output(self, output, remove_tokens = True, ** kwargs):
         if self.is_encoder_decoder:
             return self.decode_text(output, remove_tokens = remove_tokens, ** kwargs)
-        return self.text_encoder.ctc_decode(output, remove_tokens = remove_tokens, ** kwargs)
+        return self.ctc_decode_text(output, remove_tokens = remove_tokens, ** kwargs)
 
-    def encode_data(self, data):
-        image   = self.get_input(data)
-        tokens  = self.get_output(data, key = 'label')
+    def prepare_data(self, data):
+        image   = self.prepare_input(data)
+        tokens  = self.prepare_output(data, key = 'label')
 
         if self.is_encoder_decoder:
             return (image, tokens[:-1]), tokens[1:]
@@ -110,32 +112,23 @@ class BaseOCR(BaseImageModel, BaseTextModel):
         return self.filter_image(image)
     
     def filter_output(self, output):
-        return tf.logical_and(
-            tf.shape(output)[0] > 0, tf.shape(output)[-1] <= self.max_output_length
-        )
+        all_positive = ops.all(ops.shape(output) > 0)
+        if self.max_output_length is None: return all_positive
+        return ops.logical_and(all_positive, ops.shape(output)[-1] <= self.max_output_length)
 
-    def filter_data(self, inputs, outputs):
-        return tf.logical_and(
-            self.filter_input(inputs), self.filter_output(outputs)
-        )
-    
-    def augment_data(self, inputs, outputs):
+    def augment_input(self, inputs):
         if self.is_encoder_decoder:
-            (image, tokens) = inputs
-            return (self.augment_input(image), tokens), outputs
-        return self.augment_input(inputs), outputs
+            return (self.augment_image(inputs[0]), inputs[1])
+        return self.augment_image(inputs)
     
-    def preprocess_data(self, inputs, outputs):
-        if self.is_encoder_decoder:
-            (image, tokens) = inputs
-            return (self.preprocess_input(image), tokens), outputs
-        return self.preprocess_input(inputs), outputs
+    def process_input(self, inputs, ** kwargs):
+        if isinstance(inputs, (list, tuple)):
+            return (self.process_image(inputs[0], ** kwargs), inputs[1])
+        return self.process_image(inputs, ** kwargs)
     
-    def get_dataset_config(self, ** kwargs):
+    def get_dataset_config(self, * args, ** kwargs):
         inp_padding = (0., self.blank_token_idx) if self.is_encoder_decoder else 0.
         kwargs.update({
-            'batch_before_map'  : True,
-            'padded_batch'  : True,
             'pad_kwargs'    : {
                 'padding_values'    : (
                     inp_padding, self.blank_token_idx
@@ -143,7 +136,7 @@ class BaseOCR(BaseImageModel, BaseTextModel):
             }
         })
         
-        return super().get_dataset_config(** kwargs)
+        return super().get_dataset_config(* args, ** kwargs)
     
     @timer
     def predict(self,
@@ -161,14 +154,15 @@ class BaseOCR(BaseImageModel, BaseTextModel):
                 
                 combine     = True,
                 box_filter  = None,
-                combine_threshold = 0.0125,
                 combine_config  = {},
-                threshold   = 0.,
+                
                 dezoom_factor   = 1.,
                 
                 method  = 'beam',
+                num_beams   = 10,
                 num_sentences   = 1,
                 length_power    = 0.25,
+                threshold   = 0.,
                 
                 display = None,
                 box_processing  = None,
@@ -184,7 +178,7 @@ class BaseOCR(BaseImageModel, BaseTextModel):
                     - str   : the filename of the image
                     - dict / pd.Series  : informations about the image
                         - must contain at least `filename` or `image` + (optional) `boxes`
-                    - np.ndarray / tf.Tensor    : the raw image
+                    - np.ndarray / Tensor    : the raw image
                     
                     - list / pd.DataFrame   : an iterable of the above types
                 - batch_size    : the number of prediction to perform in parallel (currently, only `1` has been tested)
@@ -266,10 +260,15 @@ class BaseOCR(BaseImageModel, BaseTextModel):
         if display is None: display = not save
         if box_filter is not None: box_filter = combine_box_filters(box_filter)
         
-        if isinstance(images, pd.DataFrame): images = images.to_dict('records')
-        if not isinstance(images, (list, tuple, np.ndarray, tf.Tensor)): images = [images]
-        elif isinstance(images, (np.ndarray, tf.Tensor)) and len(images.shape) == 3:
-            images = tf.expand_dims(images, axis = 0)
+        if not isinstance(images, list):
+            if isinstance(images, pd.DataFrame):    images = images.to_dict('records')
+            elif isinstance(images, (str, dict)):   images = [images]
+            elif not ops.is_array(images):
+                raise ValueError(
+                    'Unsupported `images` type : {}\n{}'.format(type(images), images)
+                )
+            elif len(images.shape) == 3: images = images[None]
+
         
         ##############################
         #   Saving initialization    #
@@ -313,89 +312,90 @@ class BaseOCR(BaseImageModel, BaseTextModel):
                 infos['timestamp'] = now
                 
                 image = load_image(file if file is not None else data['image'])
-                if 'boxes' in infos:
-                    if combine:
-                        boxes, indices, rows = combine_boxes(
-                            data['boxes'],
-                            image = image,
-                            box_mode = data.get('box_mode', BoxFormat.DEFAULT),
-                            threshold = combine_threshold,
-                            ** combine_config
-                        )
-                    else:
-                        boxes = convert_box_format(
-                            data['boxes'], BoxFormat.CORNERS, image = file,
-                        )
-                        if len(boxes.shape) == 1: boxes = np.expand_dims(boxes, axis = 0)
-                        indices = list(range(len(boxes)))
-                        rows    = [boxes[i : i + 1] for i in range(len(boxes))]
-                    
-                    if box_filter is not None:
-                        keep_indexes = box_filter(boxes = boxes, indices = indices, rows = rows)
-                        boxes, rows  = boxes[keep_indexes], [rows[index] for index in keep_indexes]
-                    
-                    for i, rows_i in enumerate(rows):
-                        logger.debug('Rows : {}'.format(np.around(rows_i, decimals = 3)))
-                        outputs, scores = [], []
-                        with time_logger.timer('OCR'):
-                            for row in rows_i:
-                                inp = self.get_input(
-                                    image, bbox = row, box_mode = BoxFormat.CORNERS, dezoom_factor = dezoom_factor
-                                )
-                                if any(s == 0 for s in inp.shape):
-                                    logger.info('Invalid input encountered : {}'.format(inp.shape))
-                                    continue
-                                
-                                inp = self.preprocess_input(tf.expand_dims(inp, axis = 0))
-                                out = self.infer(
-                                    inp,
-                                    method  = method,
-                                    num_sentences   = num_sentences,
-                                    length_power    = length_power,
-                                    ** kwargs
-                                )
+                if 'boxes' not in infos:
+                    raise NotImplementedError(
+                        'Currently, only data with `boxes` key are supported'
+                    )
 
-                                if self.is_encoder_decoder:
-                                    scores.append(np.squeeze(
-                                        out.scores.numpy() / out.lengths.numpy()
-                                    ))
-                                    out = self.decode_output(out)
-                                    if isinstance(out[0], list): out = out[0]
-                                outputs.append(out[0])
-
-                            if not outputs: continue
-                            
-                            if not self.is_encoder_decoder:
-                                lengths = tf.cast([len(out) for out in outputs], tf.int32)
-                                outputs = pad_batch(outputs, pad_value = 0., dtype = np.float32)
-
-                                with time_logger.timer('CTC Beam search'):
-                                    texts, scores = self.decode_output(
-                                        outputs,
-                                        lengths = lengths,
-                                        method  = 'beam',
-                                        return_scores   = True
-                                    )
-                            else:
-                                texts   = outputs
-                                scores  = np.array(scores)
-                        
-                        if threshold < 0. and np.any(scores < threshold):
-                            continue
-                        
-                        box_infos = {
-                            'box' : boxes[i],
-                            'rows'  : rows_i,
-                            'text'  : ' \n'.join(texts),
-                            'box_mode'  : BoxFormat.CORNERS,
-                            'scores'    : scores
-                        }
-                        infos.setdefault('ocr', []).append(box_infos)
-                        
-                        if box_processing is not None:
-                            box_processing(box_infos, image = image)
+                if combine:
+                    boxes, indices, rows = combine_boxes(
+                        data['boxes'], image = image, ** combine_config
+                    )
                 else:
-                    raise NotImplementedError('Currently, only data with `boxes` key are supported !')
+                    boxes = convert_box_format(
+                        data['boxes'], BoxFormat.XYXY, image = file
+                    )
+                    if isinstance(boxes, dict): boxes = boxes['boxes']
+                    indices = list(range(len(boxes)))
+                    rows    = [boxes[i : i + 1] for i in range(len(boxes))]
+
+                if box_filter is not None:
+                    keep_indexes = box_filter(boxes = boxes, indices = indices, rows = rows)
+                    boxes, rows  = boxes[keep_indexes], [rows[index] for index in keep_indexes]
+
+                for i, rows_i in enumerate(rows):
+                    logger.debug('Rows : {}'.format(np.around(rows_i, decimals = 3)))
+                    outputs, scores = [], []
+                    with time_logger.timer('OCR'):
+                        for row in rows_i:
+                            inp = self.get_input(
+                                {'filename' : image, 'boxes' : row, 'source' : BoxFormat.XYXY},
+                                dezoom_factor = dezoom_factor
+                            )
+                            if any(s == 0 for s in inp.shape):
+                                logger.info('Invalid input encountered : {}'.format(inp.shape))
+                                continue
+
+                            out = self.infer(
+                                inp,
+                                method  = method,
+                                num_beams   = num_beams,
+                                num_sentences   = num_sentences,
+                                length_power    = length_power,
+                                ** kwargs
+                            )
+
+                            if self.is_encoder_decoder:
+                                scores.append(np.squeeze(
+                                    ops.convert_to_numpy(out.scores) / ops.convert_to_numpy(out.lengths)
+                                ))
+                                out = self.decode_output(out)
+                                if isinstance(out[0], list): out = out[0]
+                            outputs.append(out[0])
+
+                        if not outputs: continue
+
+                        if not self.is_encoder_decoder:
+                            lengths = [len(out) for out in outputs]
+                            outputs = pad_batch(outputs, pad_value = 0., dtype = np.float32)
+
+                            with time_logger.timer('CTC Beam search'):
+                                texts, scores = self.decode_output(
+                                    outputs,
+                                    lengths = lengths,
+                                    method  = method,
+                                    return_scores   = True
+                                )
+                                if isinstance(texts[0], list): texts = [txt[0] for txt in texts]
+                                scores = ops.convert_to_numpy(scores).reshape(-1)
+                        else:
+                            texts   = outputs
+                            scores  = np.array(scores)
+
+                    if threshold < 0. and np.any(scores < threshold):
+                        continue
+
+                    box_infos = {
+                        'box' : boxes[i],
+                        'rows'  : rows_i,
+                        'text'  : ' \n'.join(texts),
+                        'source'    : BoxFormat.XYXY,
+                        'scores'    : scores
+                    }
+                    infos.setdefault('ocr', []).append(box_infos)
+
+                    if box_processing is not None:
+                        box_processing(box_infos, image = image)
                 
                 if file is None: file = data
                 
@@ -434,11 +434,13 @@ class BaseOCR(BaseImageModel, BaseTextModel):
                      callback   = None,
                      buffer_size    = 1,
                      wait_factor    = 0.,
+                     duplicate_tolerance    = 2,
                      duplicate_wait_time    = 0.2,
                      
                      threshold  = -0.2,
                      region     = [0.25, 0.15, 0.6, 0.95],
                      n_repeat   = 2,
+                     filters    = None,
                      ** kwargs
                     ):
         ####################
@@ -451,14 +453,19 @@ class BaseOCR(BaseImageModel, BaseTextModel):
         def perform_ocr(detected, image, infos):
             if len(infos.get('boxes', {}).get('width', ())) == 0: return
             
+            is_duplicate = False
             if _state['prev_output'] is not None:
                 dice = dice_coeff(infos['output'], _state['prev_output'])
                 if dice >= 0.9:
+                    is_duplicate = True
+                    
                     _state['n_skipped'] += 1
                     _state['n_duplicates'] += 1
                     if not filename and _state['n_duplicates'] % 2 == 0:
                         time.sleep(duplicate_wait_time)
-                    return
+                    
+                    if _state['n_duplicates'] > duplicate_tolerance:
+                        return
             
             res = self.predict(
                 {** infos, 'image' : image},
@@ -475,61 +482,69 @@ class BaseOCR(BaseImageModel, BaseTextModel):
                 ** kwargs
             )[0][-1]
 
-            if res.get('ocr', []):
-                res['ocr'] = [
-                    ocr_res for ocr_res in res['ocr']
+            is_empty    = len(res.get('ocr', [])) == 0
+            if not is_empty:
+                res['ocr']  = [
+                    ocr_res for ocr_res in res.get('ocr', [])
                     if _filter_results(
                         ocr_res, emitted_texts, last_emitted, threshold = threshold, ** kwargs
                     )
                 ]
-                if len(res['ocr']) == 0:
+
+            if len(res.get('ocr', [])) == 0:
+                if not is_duplicate:
+                    _state['n_duplicate'] = 0
                     _state['n_skipped'] += 1
+                if not is_empty:
                     logger.info('[SKIP #{}] All results have been filtered !'.format(
                         infos['frame_index']
                     ))
-                    return
+                return
 
+            if not is_duplicate:
                 if _state['n_skipped']:
                     logger.info('{} frames skipped ({} duplicates)'.format(
                         _state['n_skipped'], _state['n_duplicates']
                     ))
-                _state.update({'n_skipped' : 0, 'n_duplicates' : 0, 'prev_output' : infos['output']})
+                _state.update({
+                    'n_skipped' : 0, 'n_duplicates' : 0, 'prev_output' : infos['output']
+                })
 
-                logger.info('\nFrame #{}'.format(infos['frame_index']))
-                if show: plot(detected)
-                for ocr_result in res['ocr']:
-                    last_emitted.append(ocr_result['text'])
-                    emitted_texts.add(ocr_result['text'])
+            logger.info('\nFrame #{}'.format(infos['frame_index']))
+            if show: plot(detected)
+            for ocr_result in res['ocr']:
+                last_emitted.append(ocr_result['text'])
+                emitted_texts.add(ocr_result['text'])
 
-                    logger.info('Box  : {}\nScores : {}\nText   : {}'.format(
-                        np.around(convert_box_format(
-                            ocr_result['box'], BoxFormat.XYWH, box_mode = BoxFormat.CORNERS
-                        ), decimals = 3),
-                        np.around(ocr_result['scores'], decimals = 3),
-                        ocr_result['text']
-                    ))
+                logger.info('Box  : {}\nScores : {}\nText   : {}'.format(
+                    np.around(convert_box_format(
+                        ocr_result['box'], BoxFormat.XYWH, box_mode = BoxFormat.CORNERS
+                    ), decimals = 3),
+                    np.around(ocr_result['scores'], decimals = 3),
+                    ocr_result['text']
+                ))
 
-                    if callback: callback(ocr_result['text'])
+                if callback: callback(ocr_result['text'])
 
-                    if show:
-                        show_boxes(image, ocr_result['box'], box_mode = ocr_result['box_mode'])
-                        if len(ocr_result['rows']) > 1:
-                            show_boxes(
-                                image,
-                                ocr_result['rows'],
-                                box_mode = ocr_result['box_mode'],
-                                ncols    = len(ocr_result['rows'])
-                            )
+                if show:
+                    show_boxes(image, ocr_result['box'], box_mode = ocr_result['box_mode'])
+                    if len(ocr_result['rows']) > 1:
+                        show_boxes(
+                            image,
+                            ocr_result['rows'],
+                            box_mode = ocr_result['box_mode'],
+                            ncols    = len(ocr_result['rows'])
+                        )
 
-                if save_frames:
-                    save_image(image = image, filename = os.path.join(
-                        frames_dir, 'frame_{}.jpg'.format(infos['frame_index'])
-                    ))
-                
-                if wait_factor > 0:
-                    time.sleep(
-                        1. + wait_factor * max([len(ocr_res['text']) for ocr_res in res['ocr']])
-                    )
+            if save_frames:
+                save_image(image = image, filename = os.path.join(
+                    frames_dir, 'frame_{}.jpg'.format(infos['frame_index'])
+                ))
+
+            if wait_factor > 0:
+                time.sleep(
+                    1. + wait_factor * max([len(ocr_res['text']) for ocr_res in res['ocr']])
+                )
 
 
         ####################
@@ -552,16 +567,19 @@ class BaseOCR(BaseImageModel, BaseTextModel):
         if '{}' in output_file:
             output_file = output_file.format(len(glob.glob(output_file.replace('{}', '*'))))
         
-        basename    = os.path.basename(output_file)
+        basename    = os.path.basename(output_file).split('.')[0]
         frames_dir  = os.path.join(directory, basename) if save_frames else None
         if save_frames: os.makedirs(frames_dir, exist_ok = True)
         
         # Initializes filters
-        filters = [SizeFilter(min_h = 0.025, min_w = 0.1),]
-        if region:      filters.append(RegionFilter(region = region, mode = 'center'))
-        if n_repeat:    filters.append(RepetitionFilter(n_repeat = n_repeat, filter_memory = False))
+        if filters is None:
+            filters = [SizeFilter(min_h = 0.025, min_w = 0.1)]
+            if region:
+                filters.append(RegionFilter(region = region, mode = 'center'))
+            if n_repeat:
+                filters.append(RepetitionFilter(n_repeat = n_repeat, filter_memory = False))
 
-        logits_filter = build_masking_filter(indices = self.text_encoder.ukn_token_idx)
+        logits_filter = build_masking_filter(indices = self.ukn_token_idx)
         
         cam = filename
         if not filename:
@@ -618,9 +636,9 @@ def post_process(results, idx, display, post_processing):
                     np.around(box_infos['scores'], decimals = 3), box_infos['text']
                 ))
                 plot(load_image(
-                    image, bbox = box_infos['box'], box_mode = BoxFormat.CORNERS
+                    image, boxes = box_infos['box'], source = BoxFormat.CORNERS
                 ))
-            
+        
         if post_processing is not None:
             try:
                 post_processing(infos, image = file)
@@ -651,12 +669,12 @@ def _filter_results(ocr_result,
 
     ocr_result['scores'] = np.array(ocr_result['scores'])
     if threshold != 0. and np.any(ocr_result['scores'] <= threshold):
-        logger.info('Some scores are too low : {} !'.format(
-            np.around(ocr_result['scores'], decimals = 3)
-        ))
+        parts = text.split(' \n')
+        logger.info('Some scores are too low !\n{}'.format('\n'.join([
+            '- {:.3f} : {}'.format(s, t) for s, t in zip(ocr_result['scores'], parts)
+        ])))
         if np.all(ocr_result['scores'] <= threshold): return False
 
-        parts = text.split(' \n')
         logger.info('Parts : {}'.format(parts))
         text = ' \n'.join([
             p if s > threshold else '' for p, s in zip(parts, ocr_result['scores'])

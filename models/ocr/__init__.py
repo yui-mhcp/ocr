@@ -1,6 +1,5 @@
-
-# Copyright (C) 2022 yui-mhcp project's author. All rights reserved.
-# Licenced under the Affero GPL v3 Licence (the "Licence").
+# Copyright (C) 2022-now yui-mhcp project author. All rights reserved.
+# Licenced under a modified Affero GPL v3 Licence (the "Licence").
 # you may not use this file except in compliance with the License.
 # See the "LICENCE" file at the root of the directory for the licence information.
 #
@@ -10,8 +9,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from models.ocr.base_ocr import BaseOCR
-from models.ocr.crnn import CRNN
+from .base_ocr import BaseOCR
+from .crnn import CRNN
 
 def get_model(model = None, lang = None):
     assert model is not None or lang is not None
@@ -34,9 +33,11 @@ def ocr(image, model = None, lang = 'en', ** kwargs):
     model = get_model(model = model, lang = lang)
     return model.predict(image, ** kwargs)
 
-_models = {
-    'CRNN'      : CRNN
-}
+def ocr_stream(filename = None, url = None, model = None, lang = 'en', ** kwargs):
+    if 'gpu_memory' in kwargs:  limit_gpu_memory(kwargs.pop('gpu_memory'))
+    if 'gpu_growth' in kwargs:  set_memory_growth(kwargs.pop('gpu_growth'))
+    model = get_model(model = model, lang = lang)
+    return model.stream_video(filename, url, ** kwargs)
 
 _pretrained = {
     'en'    : 'crnn_en'

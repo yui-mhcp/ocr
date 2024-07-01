@@ -1,6 +1,5 @@
-
-# Copyright (C) 2022 yui-mhcp project's author. All rights reserved.
-# Licenced under the Affero GPL v3 Licence (the "Licence").
+# Copyright (C) 2022-now yui-mhcp project author. All rights reserved.
+# Licenced under a modified Affero GPL v3 Licence (the "Licence").
 # you may not use this file except in compliance with the License.
 # See the "LICENCE" file at the root of the directory for the licence information.
 #
@@ -10,9 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import tensorflow as tf
-
-from models.ocr.base_ocr import BaseOCR
+from .base_ocr import BaseOCR
 
 class CRNN(BaseOCR):
     def __init__(self, lang = 'multi', * args, pretrained = None, pretrained_lang = None, ** kwargs):
@@ -49,27 +46,14 @@ class CRNN(BaseOCR):
         
         super().__init__(lang, * args, ** kwargs)
         
-    def _build_model(self, original_vocab = None, architecture = 'CRNN', ** kwargs):
-        super(BaseOCR, self)._build_model(model = {
-            'architecture_name' : architecture,
-            'input_shape'   : self.input_size,
-            'output_dim'    : self.vocab_size,
-            'vocab_size'    : self.vocab_size,
-            ** kwargs
-        })
-        
-        #if hasattr(self.model, 'change_vocabulary') and original_vocab:
-        #    self.model.change_vocabulary(self.vocab, old_vocab = original_vocab)
+    def build(self, *, model = None, original_vocab = None, architecture = 'CRNN', ** kwargs):
+        if model is None:
+            model   = {
+                'architecture'  : architecture,
+                'input_shape'   : self.input_size,
+                'output_dim'    : self.vocab_size,
+                'vocab_size'    : self.vocab_size,
+                ** kwargs
+            }
+        super().build(model = model)
     
-    def compile(self, loss = None, metrics = None, ** kwargs):
-        kwargs.setdefault('loss_config', {}).update({
-            'pad_value' : self.blank_token_idx, 'from_logits' : True
-        })
-        kwargs.setdefault('metrics_config', {}).update({
-            'pad_value' : self.blank_token_idx, 'from_logits' : True
-        })
-        
-        if not loss: loss = 'CTCLoss' if not self.is_encoder_decoder else 'TextLoss'
-        if not metrics: metrics = ['TextMetric'] if not self.is_encoder_decoder else ['TextAccuracy']
-        
-        return super().compile(loss = loss, metrics = metrics, ** kwargs)
