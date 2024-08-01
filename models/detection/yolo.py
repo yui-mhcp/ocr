@@ -115,6 +115,7 @@ class YOLO(BaseDetector):
     def decode_output(self, output, obj_threshold = None, nms_threshold = None, ** kwargs):
         if obj_threshold is None: obj_threshold = self.obj_threshold
         if nms_threshold is None: nms_threshold = self.nms_threshold
+        kwargs.setdefault('labels', self.labels)
         
         return decode_output(
             output, obj_threshold = obj_threshold, nms_threshold = nms_threshold, ** kwargs
@@ -215,11 +216,13 @@ class YOLO(BaseDetector):
         return instance
 
 @timer(name = 'output decoding')
-def decode_output(output, *, obj_threshold = 0.35, nms_threshold = 0.2, ** kwargs):
+def decode_output(output, *, obj_threshold = 0.35, nms_threshold = 0.2, labels = None, ** kwargs):
     output = ops.convert_to_numpy(output)
     
     if len(output.shape) == 5:
-        kwargs.update({'obj_threshold' : obj_threshold, 'nms_threshold' : nms_threshold})
+        kwargs.update({
+            'obj_threshold' : obj_threshold, 'nms_threshold' : nms_threshold, 'labels' : labels
+        })
         return [decode_output(out, ** kwargs) for out in output]
     
     with time_logger.timer('init'):
@@ -240,15 +243,15 @@ def decode_output(output, *, obj_threshold = 0.35, nms_threshold = 0.2, ** kwarg
         
         valids  = np.all(xy_max > xy_min, axis = 1)
         boxes   = np.concatenate([xy_min[valids], xy_max[valids]], axis = 1)
-        classes = scores[valids]
+        classes  = scores[valids]
 
     # suppress non-maximal boxes
     with time_logger.timer('NMS'):
         ious = {}
         for c in range(nb_class):
-            scores = classes[:, c]
-            sorted_indices = np.argsort(scores)[::-1]
-            sorted_indices = sorted_indices[scores[sorted_indices] > obj_threshold]
+            scores_c = classes[:, c]
+            sorted_indices = np.argsort(scores_c)[::-1]
+            sorted_indices = sorted_indices[scores_c[sorted_indices] > obj_threshold]
 
             for i, index_i in enumerate(sorted_indices):
                 if classes[index_i, c] < obj_threshold: continue
@@ -265,7 +268,15 @@ def decode_output(output, *, obj_threshold = 0.35, nms_threshold = 0.2, ** kwarg
                     if ious[(index_i, index_j)] >= nms_threshold:
                         classes[index_j, c] = 0
 
-    return {'boxes' : boxes[np.max(classes, 1) > obj_threshold], 'format' : 'xyxy'}
+    scores  = np.max(classes, axis = 1)
+    mask    = scores > obj_threshold
+    classes = np.argmax(classes[mask], axis = 1)
+    return {
+        'boxes'     : boxes[mask],
+        'labels'    : [labels[idx] for idx in classes] if labels else classes,
+        'scores'    : scores[mask],
+        'format'    : 'xyxy'
+    }
 
 def decode_darknet_weights(model, wt_path):
     #Chargement des poids
