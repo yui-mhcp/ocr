@@ -20,6 +20,7 @@ from keras import layers
 
 from .current_blocks import Conv2DBN, set_cudnn_lstm
 from .generation_utils import infer
+from utils.wrapper_utils import partial
 from utils.keras_utils import TensorSpec, ops, graph_compile
 from custom_layers import get_activation, CustomRNNDropoutCell, CustomEmbedding
 
@@ -275,7 +276,7 @@ class AttentionCell(keras.layers.Layer, CustomRNNDropoutCell):
         prev_state, step = prev_state
         
         if encoder_output_proj is None:
-            encoder_output_proj = self.process_memory(encoder_output)
+            encoder_output_proj = self.process_memory(encoder_output, training = training)
         
         prev_state_proj = K.expand_dims(self.h2h(prev_state[0]), axis = 1)
         prev_state_proj = self.dropout(
@@ -664,12 +665,13 @@ class CRNNWithAttn(keras.Model):
              inputs,
              encoder_output,
              initial_state,
-
+             
+             encoder_output_proj    = None,
+             
              training = False,
              attn_mask_offset  = 5,
              attn_mask_win_len = 16,
              
-             debug  = False,
              ** kwargs
             ):
         if initial_state is None:
@@ -697,6 +699,7 @@ class CRNNWithAttn(keras.Model):
             embeddings,
             encoder_output,
             initial_state.attention_state,
+            encoder_output_proj = encoder_output_proj,
             training    = training,
             mask    = attn_mask
         )
@@ -725,7 +728,7 @@ class CRNNWithAttn(keras.Model):
             attention_weights = attn
         )
 
-    @graph_compile(prefer_xla = True)
+    @graph_compile(prefer_xla = True, cast_kwargs = False)
     def infer(self,
               inputs : TensorSpec(dtype = 'float'),
               training      = False,
@@ -734,21 +737,28 @@ class CRNNWithAttn(keras.Model):
               attn_mask_offset  : TensorSpec(shape = (), dtype = 'int32', static = True)    = 5,
               attn_mask_win_len : TensorSpec(shape = (), dtype = 'int32', static = True)    = 16,
               
+              use_cache = None,
+              
               ** kwargs
              ):
         memory = self.encoder(inputs, training = training)
+        memory_proj = self.attn_cell.process_memory(memory, training = training)
         return infer(
             self,
             encoder_output = memory,
 
-            max_length        = max_length,
-            attn_mask_offset  = attn_mask_offset,
-            attn_mask_win_len = attn_mask_win_len,
-            
-            step_fn     = self.step,
-            
             use_cache   = True,
+            max_length  = max_length,
             is_transformer  = False,
+            
+            step_fn     = partial(
+                self.step,
+                
+                encoder_output_proj = memory_proj,
+                
+                attn_mask_offset    = attn_mask_offset,
+                attn_mask_win_len   = attn_mask_win_len
+            ),
             
             ** kwargs
         )

@@ -11,9 +11,9 @@
 
 import logging
 
-from models.detection.yolo import YOLO
-from models.detection.east import EAST
-from models.saving import get_models, get_model_config, is_model_name
+from .yolo import YOLO
+from .east import EAST
+from models.utils import get_models, get_model_config, is_model_name
 
 logger = logging.getLogger(__name__)
 

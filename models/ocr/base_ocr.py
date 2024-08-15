@@ -16,12 +16,15 @@ import logging
 import numpy as np
 import pandas as pd
 
+from utils import *
+from models.utils import *
+from utils.callbacks import *
 from loggers import timer, time_logger
 from utils.keras_utils import TensorSpec, ops
 from utils import plot, load_json, dump_json, get_filename, should_predict, pad_batch
 from utils.distance import dice_coeff, edit_distance
 from utils.text import build_masking_filter
-from utils.image import HTTPScreenMirror, save_image, load_image
+from utils.image import _image_formats, HTTPScreenMirror, save_image, load_image
 from utils.image.bounding_box import *
 from models.interfaces.base_text_model import BaseTextModel
 from models.interfaces.base_image_model import BaseImageModel
@@ -30,6 +33,10 @@ from custom_architectures.current_blocks import set_cudnn_lstm
 logger  = logging.getLogger(__name__)
 
 class BaseOCR(BaseImageModel, BaseTextModel):
+    _directories    = {
+        ** BaseImageModel._directories, 'stream_dir' : '{root}/{self.name}/stream'
+    }
+
     output_signature    = BaseTextModel.text_signature
 
     augment_raw_data    = BaseImageModel.augment_box
@@ -47,10 +54,6 @@ class BaseOCR(BaseImageModel, BaseTextModel):
         set_cudnn_lstm(self.model)
                 
         if hasattr(self.model, 'set_tokens'): self.model.set_tokens(** self.model_tokens)
-    
-    @property
-    def stream_dir(self):
-        return os.path.join(self.folder, "stream")
 
     @property
     def input_signature(self):
@@ -79,7 +82,8 @@ class BaseOCR(BaseImageModel, BaseTextModel):
     
     @timer(name = 'inference')
     def infer(self, inputs, training = False, ** kwargs):
-        if len(ops.shape(inputs)) == 3: inputs = inputs[None]
+        if ops.rank(inputs) == 3: inputs = ops.expand_dims(inputs, axis = 0)
+        
         if hasattr(self.model, 'infer'):
             kwargs.setdefault('max_length', self.max_output_length)
         
@@ -138,22 +142,73 @@ class BaseOCR(BaseImageModel, BaseTextModel):
         
         return super().get_dataset_config(* args, ** kwargs)
     
+    def get_prediction_callbacks(self,
+                                 *,
+
+                                 save    = True,
+                                 save_if_raw    = None,
+                                 
+                                 directory  = None,
+                                 raw_img_dir    = None,
+                                 
+                                 filename   = 'image_{}.jpg',
+                                 # Verbosity config
+                                 verbose = 1,
+                                 display = None,
+                                 
+                                 use_multithreading = False,
+
+                                 ** kwargs
+                                ):
+        if save and save_if_raw is None: save_if_raw = True
+        elif save_if_raw: save = True
+        if display is None: display = not save
+
+        if directory is None: directory = self.pred_dir
+        map_file    = os.path.join(directory, 'map.json')
+        
+        predicted   = {}
+        callbacks   = []
+        if save_if_raw:
+            if raw_img_dir is None: raw_img_dir = os.path.join(directory, 'images')
+            callbacks.append(ImageSaver(
+                key = 'filename',
+                name    = 'saving raw',
+                cond    = lambda filename = None, ** _: not isinstance(filename, str),
+                data_key    = 'image',
+                file_format = os.path.join(raw_img_dir, filename),
+                index_key   = 'frame_index',
+                use_multithreading  = use_multithreading
+            ))
+            
+        if save:
+            predicted   = load_json(map_file, {})
+        
+            callbacks.append(JSonSaver(
+                data    = predicted,
+                filename    = map_file,
+                primary_key = 'filename',
+                use_multithreading = use_multithreading
+            ))
+        
+        if display:
+            callbacks.append(OCRDisplayer())
+        
+        return predicted, ['ocr'], callbacks
+
     @timer
     def predict(self,
                 images,
                 batch_size = 1,
+                *,
                 
                 detector   = None,
                 detector_kwargs = {'merge_method' : 'union'},
                 
-                save    = True,
-                directory   = None,
                 overwrite   = False,
-                timestamp   = -1,
-                save_if_raw = True,
                 
                 combine     = True,
-                box_filter  = None,
+                box_filters = None,
                 combine_config  = {},
                 
                 dezoom_factor   = 1.,
@@ -164,9 +219,11 @@ class BaseOCR(BaseImageModel, BaseTextModel):
                 length_power    = 0.25,
                 threshold   = 0.,
                 
-                display = None,
                 box_processing  = None,
-                post_processing = None,
+                
+                predicted   = None,
+                _callbacks  = None,
+                required_keys   = None,
                 
                 ** kwargs
                ):
@@ -236,15 +293,9 @@ class BaseOCR(BaseImageModel, BaseTextModel):
             result   = ocr_model.predict(detected, combine = True)
             ``` 
         """
-        ####################
-        # helping function #
-        ####################
-        
-        def save_raw_image(image):
-            os.makedirs(raw_img_dir, exist_ok = True)
-            filename = os.path.join(raw_img_dir, 'image_{}.png'.format(len(os.listdir(raw_img_dir))))
-            save_image(image = image, filename = filename)
-            return filename
+        ########################################
+        #     Initial detection (optional)     #
+        ########################################
         
         now = time.time()
         
@@ -254,166 +305,422 @@ class BaseOCR(BaseImageModel, BaseTextModel):
                 detector = get_pretrained(detector)
             
             for k in ('save', 'display'): detector_kwargs.setdefault(k, False)
-            detected = detector.predict(images, ** detector_kwargs)
-            images = [detect[-1] for detect in detected]
-
-        if display is None: display = not save
-        if box_filter is not None: box_filter = combine_box_filters(box_filter)
-        
-        if not isinstance(images, list):
-            if isinstance(images, pd.DataFrame):    images = images.to_dict('records')
-            elif isinstance(images, (str, dict)):   images = [images]
-            elif not ops.is_array(images):
-                raise ValueError(
-                    'Unsupported `images` type : {}\n{}'.format(type(images), images)
-                )
-            elif len(images.shape) == 3: images = images[None]
-
-        
-        ##############################
-        #   Saving initialization    #
-        ##############################
-        
-        if directory is None: directory = self.pred_dir
-        map_file    = os.path.join(directory, 'map.json')
-        raw_img_dir = os.path.join(directory, 'images')
-        
-        predicted   = load_json(map_file, default = {})
+            images = [out[-1] for out in detector.predict(images, ** detector_kwargs)]
         
         ####################
         #  Pre-processing  #
         ####################
         
-        results     = [None] * len(images)
-        duplicatas  = {}
-        requested   = [(get_filename(img, keys = ('filename', 'image')), img) for img in images]
-        
-        inputs  = []
-        for i, (file, img) in enumerate(requested):
-            if not should_predict(predicted, file, overwrite = overwrite, timestamp = timestamp, required_keys = ['ocr']):
-                results[i] = (file, predicted[file])
-                continue
+        with time_logger.timer('initialization'):
+            join_callbacks = _callbacks is None
+            if _callbacks is None:
+                predicted, required_keys, _callbacks = self.get_prediction_callbacks(** kwargs)
 
-            if isinstance(file, str):
-                duplicatas.setdefault(file, []).append(i)
-                if len(duplicatas[file]) > 1: continue
+            results, inputs, indexes, files, duplicates, filtered = prepare_prediction_results(
+                images,
+                predicted,
+                
+                rank    = 3,
+                primary_key = 'filename',
+                expand_files    = False,
+                normalize_entry = path_to_unix,
+                
+                overwrite   = overwrite,
+                required_keys   = required_keys,
+                
+                filters = lambda f: not f.endswith(_image_formats)
+            )
             
-            inputs.append((i, file, img))
+            if filtered:
+                logger.info('Skip files with unsupported extensions : {}'.format(filtered))
         
         ####################
         #  Inference loop  #
         ####################
         
-        show_idx = post_process(results, 0, display, post_processing)
+        show_idx = apply_callbacks(results, 0, _callbacks)
         
-        if len(inputs) > 0:
-            for idx, file, data in inputs:
-                infos = data.copy() if isinstance(data, dict) else {}
-                infos['timestamp'] = now
+        for idx, file, data in zip(indexes, files, inputs):
+            assert isinstance(data, dict) and 'boxes' in data
+            
+            ##############################
+            #  Image/boxes preparation   #
+            ##############################
+
+            image = self.get_image_data(data)
+
+            infos = data.copy()
+            infos['timestamp'] = now
+
+            image = self.get_image_data(data)
+            if combine:
+                boxes, indices, rows = combine_boxes(
+                    infos['boxes'], image = image, ** combine_config
+                )
+            else:
+                boxes = convert_box_format(
+                    infos['boxes'], BoxFormat.XYXY, image = image
+                )
+                if isinstance(boxes, dict): boxes = boxes['boxes']
+                indices = list(range(len(boxes)))
+                rows    = [boxes[i : i + 1] for i in range(len(boxes))]
+
+            if box_filters:
+                boxes, indices, rows = filter_boxes(box_filters, boxes, indices, rows)
+
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug('Start OCR on {}'.format(file if file else 'raw image'))
+            
+            ####################
+            #     OCR loop     #
+            ####################
+
+            for i, rows_i in enumerate(rows):
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug('- Rows : {}'.format(np.around(rows_i, decimals = 3)))
                 
-                image = load_image(file if file is not None else data['image'])
-                if 'boxes' not in infos:
-                    raise NotImplementedError(
-                        'Currently, only data with `boxes` key are supported'
-                    )
+                outputs, scores = [], []
+                with time_logger.timer('OCR'):
+                    for row in rows_i:
+                        inp = self.get_input(
+                            {'filename' : image, 'boxes' : row, 'source' : BoxFormat.XYXY},
+                            dezoom_factor = dezoom_factor
+                        )
+                        if any(s == 0 for s in inp.shape):
+                            logger.info('Invalid input encountered : {}'.format(inp.shape))
+                            continue
 
-                if combine:
-                    boxes, indices, rows = combine_boxes(
-                        data['boxes'], image = image, ** combine_config
-                    )
-                else:
-                    boxes = convert_box_format(
-                        data['boxes'], BoxFormat.XYXY, image = file
-                    )
-                    if isinstance(boxes, dict): boxes = boxes['boxes']
-                    indices = list(range(len(boxes)))
-                    rows    = [boxes[i : i + 1] for i in range(len(boxes))]
+                        out = self.infer(
+                            inp,
+                            method  = method,
+                            num_beams   = num_beams,
+                            num_sentences   = 1,
+                            length_power    = length_power,
+                            ** kwargs
+                        )
 
-                if box_filter is not None:
-                    keep_indexes = box_filter(boxes = boxes, indices = indices, rows = rows)
-                    boxes, rows  = boxes[keep_indexes], [rows[index] for index in keep_indexes]
+                        if self.is_encoder_decoder:
+                            scores.append(np.squeeze(
+                                ops.convert_to_numpy(out.scores) / ops.convert_to_numpy(out.lengths)
+                            ))
+                            out = self.decode_output(out)
+                            if isinstance(out[0], list): out = out[0]
+                        outputs.append(out[0])
 
-                for i, rows_i in enumerate(rows):
-                    logger.debug('Rows : {}'.format(np.around(rows_i, decimals = 3)))
-                    outputs, scores = [], []
-                    with time_logger.timer('OCR'):
-                        for row in rows_i:
-                            inp = self.get_input(
-                                {'filename' : image, 'boxes' : row, 'source' : BoxFormat.XYXY},
-                                dezoom_factor = dezoom_factor
+                    if not outputs: continue
+
+                    if not self.is_encoder_decoder:
+                        with time_logger.timer('CTC Beam search'):
+                            lengths = np.array([len(out) for out in outputs], dtype = 'int32')
+                            outputs = stack_batch(
+                                outputs, pad_value = 0., dtype = 'float32', maybe_pad = True
                             )
-                            if any(s == 0 for s in inp.shape):
-                                logger.info('Invalid input encountered : {}'.format(inp.shape))
-                                continue
 
-                            out = self.infer(
-                                inp,
+                            texts, scores = self.decode_output(
+                                outputs,
+                                lengths = lengths,
                                 method  = method,
-                                num_beams   = num_beams,
-                                num_sentences   = num_sentences,
-                                length_power    = length_power,
+                                return_scores   = True,
                                 ** kwargs
                             )
+                            if isinstance(texts[0], list): texts = [txt[0] for txt in texts]
+                            scores = ops.convert_to_numpy(scores).reshape(-1)
+                    else:
+                        texts   = outputs
+                        scores  = np.array(scores)
 
-                            if self.is_encoder_decoder:
-                                scores.append(np.squeeze(
-                                    ops.convert_to_numpy(out.scores) / ops.convert_to_numpy(out.lengths)
-                                ))
-                                out = self.decode_output(out)
-                                if isinstance(out[0], list): out = out[0]
-                            outputs.append(out[0])
+                if threshold < 0. and np.any(scores < threshold):
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug('- Prediction score is too low, skipping this prediction')
+                    continue
 
-                        if not outputs: continue
+                box_infos = {
+                    'box' : boxes[i],
+                    'rows'  : rows_i,
+                    'text'  : ' \n'.join(texts),
+                    'source'    : BoxFormat.XYXY,
+                    'scores'    : scores
+                }
+                infos.setdefault('ocr', []).append(box_infos)
 
-                        if not self.is_encoder_decoder:
-                            lengths = [len(out) for out in outputs]
-                            outputs = pad_batch(outputs, pad_value = 0., dtype = np.float32)
+                if box_processing is not None:
+                    box_processing(box_infos, image = image)
 
-                            with time_logger.timer('CTC Beam search'):
-                                texts, scores = self.decode_output(
-                                    outputs,
-                                    lengths = lengths,
-                                    method  = method,
-                                    return_scores   = True
-                                )
-                                if isinstance(texts[0], list): texts = [txt[0] for txt in texts]
-                                scores = ops.convert_to_numpy(scores).reshape(-1)
-                        else:
-                            texts   = outputs
-                            scores  = np.array(scores)
+            if file:
+                for duplicate_idx in duplicates[file]:
+                    results[duplicate_idx] = (predicted.get(file, {}), infos)
+            else:
+                results[idx] = ({}, infos)
 
-                    if threshold < 0. and np.any(scores < threshold):
-                        continue
+            show_idx = apply_callbacks(results, show_idx, _callbacks)
 
-                    box_infos = {
-                        'box' : boxes[i],
-                        'rows'  : rows_i,
-                        'text'  : ' \n'.join(texts),
-                        'source'    : BoxFormat.XYXY,
-                        'scores'    : scores
-                    }
-                    infos.setdefault('ocr', []).append(box_infos)
+        if join_callbacks:
+            for callback in _callbacks:
+                if isinstance(callback, Callback): callback.join()
 
-                    if box_processing is not None:
-                        box_processing(box_infos, image = image)
-                
-                if file is None: file = data
-                
-                if isinstance(file, str):
-                    infos['filename']   = file
-                    predicted[file] = infos
+        return [
+            (stored.get('filename', None), out if out else stored)
+            for stored, out in results
+        ]
+
+    def stream(self,
+               stream,
+               *,
+               
+               show = False,
+               display  = False,
+               max_time = None,
+               
+               detector = 'east',
+               
+               save = True,
+               save_stream  = None,
+               save_frames  = None,
+               save_transformed = False,
+               
+               directory    = None,
+               filename     = 'frame-{}.jpg',
+               stream_name  = None,
+               
+               output_shape = None,
+
+               callback = None,
+               buffer_size  = 1,
+               wait_factor  = 0.,
+               duplicate_threshold  = 0.9,
+               duplicate_warmup     = 10,
+               duplicate_tolerance  = 5,
+               duplicate_wait_time  = 0.2,
+
+               filters  = None,
+               region   = [0.2, 0.1, 0.6, 0.95],
+               n_repeat = 2,
+               ioa_threshold    = 0.9,
+               
+               threshold    = -0.2,
+               
+               ** kwargs
+              ):
+        ####################
+        #    OCR method    #
+        ####################
+        
+        _state  = {
+            'prev_output'   : None,
+            'emitted_texts' : [],
+            'emitted_boxes' : (),
+            'n_skipped'     : 0,
+            'n_duplicates'  : 0,
+            'warmup_frames' : 0,
+            'warmup'    : False
+        }
+        emitted_texts = set()
+        
+        def _filter_emitted_boxes(boxes, ** _):
+            if len(_state['emitted_boxes']) == 0: return list(range(len(boxes)))
+            ioa = compute_ioa(boxes, _state['emitted_boxes'], as_matrix = True)
+            return np.where(np.any(ioa >= ioa_threshold, axis = 1))[0]
+
+        def perform_ocr(image, boxes, output, frame_index, detected = None, ** _):
+            if len(boxes['boxes']) == 0: return
+            if ops.rank(output) == 3: output = output[:, :, 0]
+            
+            is_duplicate = False
+            if _state['prev_output'] is not None:
+                dice = dice_coeff(output, _state['prev_output'])
+                if dice >= duplicate_threshold:
+                    is_duplicate = True
                     
-                    for duplicate_idx in duplicatas[file]:
-                        results[duplicate_idx] = (file, infos)
-                    
-                    if save:
-                        dump_json(map_file, predicted, indent = 4)
+                    if _state['warmup']:
+                        _state['warmup_frames'] += 1
+                        if _state['warmup_frames'] > duplicate_warmup: _state['warmup'] = False
+                    else:
+                        _state['n_duplicates'] += 1
+                        if not _is_file_stream and _state['n_duplicates'] % 2 == 0:
+                            time.sleep(duplicate_wait_time)
+
+                        if _state['n_duplicates'] > duplicate_tolerance and _state['n_skipped'] > duplicate_tolerance:
+                            _state['n_skipped'] += 1
+                            return
+            
+            if not is_duplicate:
+                _state.update({
+                    'prev_output'   : output,
+                    'n_duplicates'  : 0,
+                    'warmup_frames' : 1,
+                    'emitted_texts' : [],
+                    'emitted_boxes' : (),
+                    'warmup'    : True
+                })
+            
+            res = self.predict(
+                {'image' : image, 'boxes' : boxes},
+
+                combine = True,
+                box_filters = filters,
+                
+                logits_filter     = logits_filter,
+
+                predicted   = {},
+                _callbacks  = [],
+                required_keys   = [],
+                
+                ** kwargs
+            )[0][-1]
+
+            is_empty    = len(res.get('ocr', [])) == 0
+            if not is_empty:
+                res['ocr']  = [
+                    ocr_res for ocr_res in res['ocr']
+                    if _filter_results(
+                        ocr_res, emitted_texts, _state['emitted_texts'], threshold = threshold, ** kwargs
+                    )
+                ]
+            
+            if len(res.get('ocr', [])) == 0:
+                _state['n_skipped'] += 1
+                
+                if not is_empty:
+                    logger.info('[SKIP #{}] All results have been filtered !'.format(frame_index))
+                
+                return
+
+            logger.info('\nFrame #{}'.format(frame_index))
+            emitted_boxes = np.array([ocr_res['box'] for ocr_res in res['ocr']])
+            if not _state['emitted_texts']:
+                logger.info('- 1st emission ({} warmup - {} duplicates - {} skipped)'.format(
+                    _state['warmup_frames'], _state['n_duplicates'], _state['n_skipped']
+                ))
+                _state['emitted_boxes'] = emitted_boxes
+            else:
+                _state['emitted_boxes'] = np.concatenate([
+                    _state['emitted_boxes'], emitted_boxes
+                ], axis = 0)
+
+            _state['n_skipped'] = 0
+
+            if display:
+                if detected is None:
+                    detected = draw_boxes(ops.convert_to_numpy(image, copy = True), boxes)
+                plot(detected, plot_type = 'imshow')
+            
+            for ocr_result in res['ocr']:
+                _state['emitted_texts'].append(ocr_result['text'])
+                emitted_texts.add(ocr_result['text'])
+
+                logger.info('Box  : {}\nScores : {}\nText   : {}'.format(
+                    np.around(convert_box_format(
+                        ocr_result['box'], target = BoxFormat.XYWH, source = ocr_result['source']
+                    ), decimals = 3),
+                    np.around(ocr_result['scores'], decimals = 3),
+                    ocr_result['text']
+                ))
+
+                if callback: callback(ocr_result['text'])
+
+                if display > 1:
+                    show_boxes(image, ocr_result['box'], source = ocr_result['source'])
+                    if len(ocr_result['rows']) > 1:
+                        show_boxes(
+                            image,
+                            ocr_result['rows'],
+                            source = ocr_result['source'],
+                            ncols    = len(ocr_result['rows'])
+                        )
+
+            if save_frames:
+                apply_callbacks_raw({
+                    'image' : image, 'frame_index' : frame_index, 'boxes' : boxes, ** res
+                }, callbacks)
+
+            if wait_factor:
+                time.sleep(
+                    1. + wait_factor * max([len(ocr_res['text']) for ocr_res in res['ocr']])
+                )
+
+
+        ####################
+        #  Initialization  #
+        ####################
+        
+        if isinstance(detector, str):
+            from models import get_pretrained
+            detector = get_pretrained(detector)
+        
+        if callback is not None and not callable(callback):
+            assert hasattr(callback, 'put'), '`callback` must be callable or have a put method !'
+            callback = callback.put
+        
+        _is_file_stream = isinstance(stream, str) and os.path.isfile(stream)
+        
+        if save_stream is None: save_stream = save and not _is_file_stream
+        if save_frames is None: save_frames = save
+        if max_time is None:    max_time = 600 if not _is_file_stream else 0
+        
+        if directory is None: directory = self.stream_dir
+        if not stream_name:
+            stream_name = 'stream-{}' if not _is_file_stream else os.path.basename(stream).split('.')[0]
+        
+        stream_dir = os.path.join(directory, stream_name)
+        if contains_index_format(stream_dir):
+            stream_dir  = format_path_index(stream_dir)
+            stream_name = os.path.basename(stream_dir)
+        
+        _, _, callbacks = self.get_prediction_callbacks(
+            save    = save_frames,
+            display = False,
+            save_if_raw = save_frames,
+            directory   = stream_dir,
+            filename    = filename,
+            use_multithreading  = kwargs.get('use_multithreading', True)
+        )
+        
+        # Initializes filters
+        if filters is None:
+            filters = [SizeFilter(min_h = 0.025, min_w = 0.1)]
+            if region:
+                filters.append(RegionFilter(region = region, mode = 'center'))
+            if n_repeat:
+                filters.append(RepetitionFilter(n_repeat = n_repeat, filter_memory = False))
+        elif not isinstance(filters, list):
+            filters = [filters]
+        
+        if ioa_threshold:
+            filters.append(_filter_emitted_boxes)
+        
+        logits_filter = ops.convert_to_tensor([self.ukn_token_idx], 'int32')
+        
+        camera = stream
+        if not _is_file_stream and isinstance(stream, str) and stream.startswith('http://192'):
+            for _ in range(5):
+                camera = HTTPScreenMirror(stream)
+                ret, frame  = cam.read()
+                if not ret:
+                    time.sleep(1)
                 else:
-                    results[idx] = (file if file is not None else img, infos)
-                
-                show_idx = post_process(results, show_idx, display, post_processing)
+                    output_shape    = frame.shape[:2]
+                    break
+            if not ret: raise RuntimeError('Unable to connect to {} !'.format(stream))
 
-        return results
+        return detector.stream(
+            camera,
+            show    = show,
+            max_time    = max_time,
+            buffer_size  = buffer_size,
+
+            save    = False,
+            display = False,
+            directory   = directory,
+            stream_name = stream_name,
+            save_stream = save_stream,
+            
+            output_shape = output_shape,
+
+            return_output   = True,
+            post_processing = perform_ocr,
+            
+            ** kwargs
+        )
 
     def stream_video(self,
                      filename   = None,
@@ -555,7 +862,7 @@ class BaseOCR(BaseImageModel, BaseTextModel):
             from models import get_pretrained
             detector = get_pretrained(detector)
         
-        if not callable(callback):
+        if callback is not None and not callable(callback):
             assert hasattr(callback, 'put'), '`callback` must be callable or have a put method !'
             callback = callback.put
         
@@ -623,32 +930,6 @@ class BaseOCR(BaseImageModel, BaseTextModel):
         })
         return config
 
-@timer
-def post_process(results, idx, display, post_processing):
-    while idx < len(results) and results[idx] is not None:
-        file, infos = results[idx]
-        
-        if display:
-            image = load_image(file).numpy()
-            plot(draw_boxes(image.copy(), infos['boxes'], show_text = False))
-            for box_infos in infos['ocr']:
-                logger.info('Text (score {}) : {}'.format(
-                    np.around(box_infos['scores'], decimals = 3), box_infos['text']
-                ))
-                plot(load_image(
-                    image, boxes = box_infos['box'], source = BoxFormat.CORNERS
-                ))
-        
-        if post_processing is not None:
-            try:
-                post_processing(infos, image = file)
-            except Exception as e:
-                logger.error('An error occured in the `post_processing` function !\n  {}'.format(e))
-        
-        idx += 1
-        
-    return idx
-
 def _filter_results(ocr_result,
                     reject,
                     last_emitted    = [],
@@ -664,7 +945,9 @@ def _filter_results(ocr_result,
     if not text: return False
     elif skip_single_word and ' ' not in text: return False
     elif skip_non_alpha and not any(c.isalpha() for c in text): return False
-    elif text in reject: return False
+    elif text in reject:
+        logger.info('Detected text was already emitted')
+        return False
     
 
     ocr_result['scores'] = np.array(ocr_result['scores'])
