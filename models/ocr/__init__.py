@@ -9,35 +9,39 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .base_ocr import BaseOCR
-from .crnn import CRNN
+import os
 
-def get_model(model = None, lang = None):
+from utils import import_objects, limit_gpu_memory
+
+globals().update(import_objects(
+    __package__.replace('.', os.path.sep), allow_functions = False
+))
+
+def get_model(model = None, lang = None, ** kwargs):
     assert model is not None or lang is not None
     
     global _pretrained
     
     if model is None:
-        if lang not in _pretrained: raise ValueError('No default model for language {}'.format(lang))
+        if lang not in _pretrained:
+            raise ValueError('No default model for language {}'.format(lang))
         model = _pretrained[lang]
 
     if isinstance(model, str):
         from models import get_pretrained
         
-        model = get_pretrained(model)
+        model = get_pretrained(model, ** kwargs)
     
     return model
 
 def ocr(image, model = None, lang = 'en', ** kwargs):
     """ See `help(ClipCap.predict)` for more information """
-    model = get_model(model = model, lang = lang)
-    return model.predict(image, ** kwargs)
+    return get_model(model = model, lang = lang, ** kwargs).predict(image, ** kwargs)
 
-def ocr_stream(filename = None, url = None, model = None, lang = 'en', ** kwargs):
+def ocr_stream(stream, model = None, lang = 'en', ** kwargs):
     if 'gpu_memory' in kwargs:  limit_gpu_memory(kwargs.pop('gpu_memory'))
-    if 'gpu_growth' in kwargs:  set_memory_growth(kwargs.pop('gpu_growth'))
-    model = get_model(model = model, lang = lang)
-    return model.stream_video(filename, url, ** kwargs)
+    
+    return get_model(model = model, lang = lang, ** kwargs).stream(stream, ** kwargs)
 
 _pretrained = {
     'en'    : 'crnn_en'

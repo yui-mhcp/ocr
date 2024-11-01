@@ -17,11 +17,12 @@ import numpy as np
 import keras.ops as K
 
 from keras import layers
+from functools import cached_property
 
 from .current_blocks import Conv2DBN, set_cudnn_lstm
 from .generation_utils import infer
 from utils.wrapper_utils import partial
-from utils.keras_utils import TensorSpec, ops, graph_compile
+from utils.keras_utils import TensorSpec, graph_compile
 from custom_layers import get_activation, CustomRNNDropoutCell, CustomEmbedding
 
 _supports_cudnn_lstm    = False
@@ -728,19 +729,24 @@ class CRNNWithAttn(keras.Model):
             attention_weights = attn
         )
 
-    @graph_compile(prefer_xla = True, cast_kwargs = False)
-    def infer(self,
-              inputs : TensorSpec(dtype = 'float'),
-              training      = False,
+    @cached_property
+    def infer(self):
+        return graph_compile(
+            self._infer, prefer_xla = True, internal_functions = infer
+        )
+    
+    def _infer(self,
+               inputs : TensorSpec(dtype = 'float'),
+               training      = False,
               
-              max_length    : TensorSpec(shape = (), dtype = 'int32', static = True)    = 512,
-              attn_mask_offset  : TensorSpec(shape = (), dtype = 'int32', static = True)    = 5,
-              attn_mask_win_len : TensorSpec(shape = (), dtype = 'int32', static = True)    = 16,
+               max_length    : TensorSpec(shape = (), dtype = 'int32', static = True)    = 512,
+               attn_mask_offset  : TensorSpec(shape = (), dtype = 'int32', static = True)    = 5,
+               attn_mask_win_len : TensorSpec(shape = (), dtype = 'int32', static = True)    = 16,
               
-              use_cache = None,
+               use_cache = None,
               
-              ** kwargs
-             ):
+               ** kwargs
+              ):
         memory = self.encoder(inputs, training = training)
         memory_proj = self.attn_cell.process_memory(memory, training = training)
         return infer(

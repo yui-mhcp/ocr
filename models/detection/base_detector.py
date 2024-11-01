@@ -10,16 +10,13 @@
 # limitations under the License.
 
 import os
-import glob
 import time
 import shutil
 import logging
 import numpy as np
-import pandas as pd
 
 from utils import *
 from utils.image import *
-from utils.callbacks import *
 from utils.keras_utils import ops
 from loggers import timer, time_logger
 from utils.image import _video_formats, _image_formats
@@ -45,7 +42,7 @@ class BaseDetector(BaseClassificationModel, BaseImageModel):
     
     def __init__(self, labels = None, *, obj_threshold  = 0.35, nms_threshold  = 0.2, ** kwargs):
         self._init_image(** kwargs)
-        self._init_labels(labels if labels is not None else ['object'], ** kwargs)
+        self._init_labels(labels if labels else ['object'], ** kwargs)
 
         self.obj_threshold  = obj_threshold
         self.nms_threshold  = nms_threshold
@@ -94,11 +91,10 @@ class BaseDetector(BaseClassificationModel, BaseImageModel):
         if as_mask:
             return mask_boxes(image, boxes, ** kwargs)
         
-        kwargs.setdefault('color', BASE_COLORS)
+        if not labels: labels = self.labels
         kwargs.setdefault('use_label', True)
-        kwargs.setdefault('labels', labels if labels is not None else self.labels)
 
-        return draw_boxes(image, boxes, ** kwargs)
+        return draw_boxes(image, boxes, labels = labels, ** kwargs)
     
     def get_prediction_callbacks(self,
                                  *,
@@ -126,6 +122,50 @@ class BaseDetector(BaseClassificationModel, BaseImageModel):
 
                                  ** kwargs
                                 ):
+        """
+            Return a list of `utils.callbacks.Callback` instances that handle data saving/display
+            
+            Arguments :
+                - save  : whether to save detection results
+                          Set to `True` if `save_boxes` or `save_detected` is True
+                - save_empty    : whether to save raw images if no object has been detected
+                - save_detected : whether to save the image with detected objects
+                - save_boxes    : whether to save boxes as individual images (not supported yet)
+                
+                - directory : root directory for saving (see below for the complete tree)
+                - raw_img_dir   : where to save raw images (default `{directory}/images`)
+                - detected_dir  : where to save images with detection (default `{directory}/detected`)
+                - boxes_dir     : where to save individual boxes (not supported yet)
+                
+                - filename  : raw image file format
+                - detected_filename : image with detection file format
+                - boxes_filename    : individual boxes file format
+                
+                - display   : whether to display image with detection
+                              If `None`, set to `True` if `save == False`
+                - verbose   : verbosity level (cumulative, i.e., level 2 includes level 1)
+                              - 1 : displays the image with detection
+                              - 2 : displays the individual boxes
+                              - 3 : logs the boxes position
+                                 
+                - post_processing   : callback function applied on the results
+                                      Takes as input all kwargs returned by `self.predict`
+                                      - image   : the raw original image (`ndarray / Tensor`)
+                                      - boxes   : the detected objects (`dict`)
+                                      * filename    : the image file (`str`)
+                                      * detected    : the image with detection (`ndarray`)
+                                      * output      : raw model output (`Tensor`)
+                                      * frame_index : the frame index in a stream (`int`)
+                                      Entries with "*" are conditionned and are not always provided
+                
+                - use_multithreading    : whether to multi-thread the saving callbacks
+                
+                - kwargs    : mainly ignored
+            Return : (predicted, required_keys, callbacks)
+                - predicted : the mapping `{filename : infos}` stored in `{directory}/map.json`
+                - required_keys : expected keys to save (see `models.utils.should_predict`)
+                - callbacks : the list of `Callback` to be applied on each prediction
+        """
         if save_detected or save_boxes: save = True
         if save_detected is None:       save_detected = save
         if display is None: display = not save
@@ -172,6 +212,7 @@ class BaseDetector(BaseClassificationModel, BaseImageModel):
             callbacks.append(JSonSaver(
                 data    = predicted,
                 filename    = map_file,
+                force_keys  = {'boxes'},
                 primary_key = 'filename',
                 use_multithreading = use_multithreading
             ))
@@ -244,12 +285,12 @@ class BaseDetector(BaseClassificationModel, BaseImageModel):
                
                - kwargs : forwarded to `self.predict` and `stream_camera`
             
-            By default, the function simply displays (wit `cv2.imshow`) the transformed stream
+            By default, the function simply displays (with `cv2.imshow`) the transformed stream (`show = True`)
             If `save == True` or `show == False` without any other configuration, it will save the raw stream (if `stream` is not a video file), and raw frames + detection information
             
             The default `stream_name` is the stream basename (if video file) or `stream-{}`
             The default `output_file` is `stream.mp4`
-            The default `transformed_file` is `{output_file_basename}-transformed.mp4`
+            The default `transformed_file` is `{basename(output_file)}-transformed.mp4`
         """
         if save is None: save = not show
         if save_stream is None:
@@ -259,7 +300,6 @@ class BaseDetector(BaseClassificationModel, BaseImageModel):
         
         if save_stream:
             if output_file is None: output_file = 'stream.mp4'
-            save = True
         
         if save_transformed and transformed_file is None:
             if output_file:                 basename = output_file
@@ -297,11 +337,12 @@ class BaseDetector(BaseClassificationModel, BaseImageModel):
             kwargs['output_file'] = os.path.join(stream_dir, output_file)
         if save_transformed:
             kwargs['transformed_file'] = os.path.join(stream_dir, transformed_file)
+        
         # for tensorflow-graph compilation (the 1st call is much slower than the next ones)
         input_size = [s if s is not None else 128 for s in self.input_size]
         self.detect(ops.zeros(input_size, dtype = 'float32'))
 
-        predicted, required_keys, callbacks    = self.get_prediction_callbacks(** kwargs)
+        predicted, required_keys, callbacks = self.get_prediction_callbacks(** kwargs)
         
         def detection(img):
             return self.predict(
@@ -410,11 +451,8 @@ class BaseDetector(BaseClassificationModel, BaseImageModel):
                 
                 output, box = (None, box) if not return_output else box
 
-                infos = {'image' : image, 'boxes' : box, 'timestamp' : now}
-                if isinstance(data, dict):
-                    infos.update(data)
-                elif file:
-                    infos['filename'] = file
+                infos = {} if not isinstance(data, dict) else data.copy()
+                infos.update({'image' : image, 'boxes' : box, 'timestamp' : now})
                 
                 if force_draw:
                     if 'image_copy' in infos:
@@ -437,10 +475,7 @@ class BaseDetector(BaseClassificationModel, BaseImageModel):
             show_idx = apply_callbacks(results, show_idx, _callbacks)
 
         if join_callbacks:
-            for callback in _callbacks:
-                if isinstance(callback, Callback): callback.join()
-
-        if videos: raise NotImplementedError()
+            for callback in _callbacks: callback.join()
         
         return [(
             stored['filename'] if 'filename' in stored else output.get('filename', output['image']),
@@ -448,215 +483,6 @@ class BaseDetector(BaseClassificationModel, BaseImageModel):
             output if output else stored
         ) for (stored, output) in results]
 
-    @timer
-    def predict_video(self,
-                      videos,
-                      save  = True,
-                      save_video = True,
-                      save_frames   = False,
-                      
-                      directory = None,
-                      overwrite = False,
-
-                      tqdm  = lambda x: x,
-                      
-                      ** kwargs
-                     ):
-        """
-            Perform prediction on `videos` (with `self.stream` method)
-            
-            Arguments :
-                - videos    : (list of) video filenames
-                - save      : whether to save the mapping file
-                - save_video    : whether to save the result video with drawn boxes
-                - save_frames   : whether to save each frame individually (see `save` in `self.predict`)
-                
-                - directory : where to save the mapping
-                - overwrite : whether to overwrite (or not) the already predicted videos
-                
-                - tqdm  : progress bar
-                
-                - kwargs    : forwarded to `self.stream`
-            Return :
-                - list of tuple [(path, infos), ...]
-                    - path  : original video path
-                    - infos : general information on the prediction with keys
-                        - width / height / fps / nb_frames  : general information on the video
-                        - frames (if `save_frames`)     : filename for the frames mapping file (i.e. the output of `self.predict`)
-                        - detected (if `save_video`)    : the path to the output video
-        """
-        if not save_frames: kwargs.update({'save_detected' : False, 'save_boxes' : False})
-        kwargs.setdefault('show', False)
-        kwargs.setdefault('max_time', -1)
-        
-        videos = normalize_filename(videos)
-        if not isinstance(videos, (list, tuple)): videos = [videos]
-        
-        # get saving directory
-        if directory is None: directory = self.pred_dir
-        
-        map_file    = os.path.join(directory, 'map_videos.json')
-        infos_videos    = load_json(map_file, default = {})
-        
-        video_dir = os.path.join(directory, 'videos')
-        
-        # Filters files that do not end with a valid video extension
-        videos = [video for video in videos if video.endswith(_video_formats)]
-        
-        for path in tqdm(set(videos)):
-            video_name, ext  = os.path.splitext(os.path.basename(path))
-            # Maybe skip because already predicted
-            if not overwrite and path in infos_videos:
-                if not save_frames or (save_frames and infos_videos[path]['frames'] is not None):
-                    if not save_video or (save_video and infos_videos[path]['detected'] is not None):
-                        continue
-            
-            save_dir    = os.path.join(video_dir, video_name)
-            out_file = None if not save_video else os.path.join(
-                save_dir, '{}_detected{}'.format(video_name, ext)
-            )
-            map_frames = os.path.join(save_dir, 'map.json') if save_frames else None
-            
-            if os.path.exists(save_dir): shutil.rmtree(save_dir)
-            if out_file and os.path.exists(out_file): os.remove(out_file)
-            if out_file: os.makedirs(save_dir, exist_ok = True)
-            
-            self.stream(
-                cam_id  = path,
-                save    = save_frames,
-                directory   = save_dir,
-                output_file = out_file,
-                
-                ** kwargs
-            )
-            
-            infos   = get_video_infos(path).__dict__
-            if out_file:    infos['detected'] = out_file
-            if save_frames: infos['frames'] = os.path.join(save_dir, 'map.json')
-
-            infos_videos[path] = infos
-        
-            dump_json(map_file, infos_videos, indent = 4)
-        
-        return [(video, infos_videos[video]) for video in videos]
-
-    def evaluate(self, 
-                 generator, 
-                 iou_threshold=0.3,
-                 score_threshold=0.3,
-                 max_detections=100,
-                 save_path=None):
-        if True:
-            raise NotImplementedError('This method is deprecated and has to be updated to be used !')
-        """ Evaluate a given dataset using a given model.
-        code originally from https://github.com/fizyr/keras-retinanet
-
-        # Arguments
-            generator       : The generator that represents the dataset to evaluate.
-            model           : The model to evaluate.
-            iou_threshold   : The threshold used to consider when a detection is positive or negative.
-            score_threshold : The score confidence threshold to use for detections.
-            max_detections  : The maximum number of detections to use per image.
-            save_path       : The path to save images with visualized detections to.
-        # Returns
-            A dict mapping class names to mAP scores.
-        """    
-        return -1.
-        # gather all detections and annotations
-        generator.batch_size = 1
-        all_detections     = [[None for i in range(len(self.labels))] for j in range(len(generator))]
-        all_annotations    = [[None for i in range(len(self.labels))] for j in range(len(generator))]
-
-        for i in range(len(generator)):
-            inputs, _ = generator.__getitem__(i)
-            raw_image, _ = inputs
-            raw_height, raw_width, raw_channels = raw_image.shape
-
-            # make the boxes and the labels
-            pred_boxes  = self._predict(inputs, get_boxes=True)
-            
-            score = np.array([box.get_score() for box in pred_boxes])
-            pred_labels = np.array([box.get_label() for box in pred_boxes])        
-            
-            if len(pred_boxes) > 0:
-                pred_boxes = np.array([[box.xmin*raw_width, box.ymin*raw_height, box.xmax*raw_width, box.ymax*raw_height, box.score] for box in pred_boxes])
-            else:
-                pred_boxes = np.array([[]])  
-            
-            # sort the boxes and the labels according to scores
-            score_sort = np.argsort(-score)
-            pred_labels = pred_labels[score_sort]
-            pred_boxes  = pred_boxes[score_sort]
-            
-            # copy detections to all_detections
-            for label in range(len(self.labels)):
-                all_detections[i][label] = pred_boxes[pred_labels == label, :]
-                
-            annotations = generator.load_annotation(i)
-            
-            # copy detections to all_annotations
-            for label in range(generator.num_classes()):
-                all_annotations[i][label] = annotations[annotations[:, 4] == label, :4].copy()
-                
-        # compute mAP by comparing all detections and all annotations
-        average_precisions = {}
-        
-        for label in range(generator.num_classes()):
-            false_positives = np.zeros((0,))
-            true_positives  = np.zeros((0,))
-            scores          = np.zeros((0,))
-            num_annotations = 0.0
-
-            for i in range(generator.size()):
-                detections           = all_detections[i][label]
-                annotations          = all_annotations[i][label]
-                num_annotations     += annotations.shape[0]
-                detected_annotations = []
-
-                for d in detections:
-                    scores = np.append(scores, d[4])
-
-                    if annotations.shape[0] == 0:
-                        false_positives = np.append(false_positives, 1)
-                        true_positives  = np.append(true_positives, 0)
-                        continue
-
-                    overlaps            = compute_overlap(np.expand_dims(d, axis=0), annotations)
-                    assigned_annotation = np.argmax(overlaps, axis=1)
-                    max_overlap         = overlaps[0, assigned_annotation]
-
-                    if max_overlap >= iou_threshold and assigned_annotation not in detected_annotations:
-                        false_positives = np.append(false_positives, 0)
-                        true_positives  = np.append(true_positives, 1)
-                        detected_annotations.append(assigned_annotation)
-                    else:
-                        false_positives = np.append(false_positives, 1)
-                        true_positives  = np.append(true_positives, 0)
-
-            # no annotations -> AP for this class is 0 (is this correct?)
-            if num_annotations == 0:
-                average_precisions[label] = 0
-                continue
-
-            # sort by score
-            indices         = np.argsort(-scores)
-            false_positives = false_positives[indices]
-            true_positives  = true_positives[indices]
-
-            # compute false positives and true positives
-            false_positives = np.cumsum(false_positives)
-            true_positives  = np.cumsum(true_positives)
-
-            # compute recall and precision
-            recall    = true_positives / num_annotations
-            precision = true_positives / np.maximum(true_positives + false_positives, np.finfo(np.float64).eps)
-
-            # compute average precision
-            average_precision  = compute_ap(recall, precision)  
-            average_precisions[label] = average_precision
-
-        return average_precisions
-                                
     def get_config(self):
         config = super(BaseDetector, self).get_config()
         config.update({

@@ -104,14 +104,6 @@ class EAST(BaseDetector):
             boxes = [{'boxes' : b, 'format' : 'xyxy'} for b in boxes]
         
         return boxes
-
-    def filter_input(self, inputs):
-        return ops.any(ops.logical_and(
-            ops.cast(inputs[0], 'bool'), outputs[-1]
-        ))
-    
-    def filter_output(self, outputs):
-        return ops.logical_not(ops.any(ops.is_nan(outputs[1])))
     
     def get_output(self, data, ** kwargs):
         raise NotImplementedError()

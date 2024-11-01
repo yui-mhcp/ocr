@@ -18,9 +18,8 @@ from loggers import timer, time_logger
 from utils.keras_utils import TensorSpec, execute_eagerly
 from utils.image.bounding_box import *
 from .base_detector import BaseDetector
-from custom_architectures import get_architecture
 
-logger      = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 PRETRAINED_COCO_URL = 'https://pjreddie.com/media/files/yolov2.weights'
 
@@ -64,6 +63,8 @@ class YOLO(BaseDetector):
             
     def build(self, flatten = True, randomize = False, model = None, ** kwargs):
         if model is None:
+            from custom_architectures import get_architecture
+            
             feature_extractor = get_architecture(
                 architecture    = self.backend,
                 input_shape     = self.input_size,
@@ -92,6 +93,10 @@ class YOLO(BaseDetector):
         return self.output_shape[2]
 
     @property
+    def nb_box(self):
+        return len(self.anchors) // 2
+
+    @property
     def output_signature(self):
         return (
             TensorSpec(
@@ -102,10 +107,6 @@ class YOLO(BaseDetector):
                 shape = (None, 1, 1, 1, self.max_box_per_image, 4), dtype = 'float32'
             )
         )
-    
-    @property
-    def nb_box(self):
-        return len(self.anchors) // 2
     
     def __str__(self):
         des = super().__str__()

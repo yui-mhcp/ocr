@@ -14,18 +14,16 @@ import glob
 import time
 import logging
 import numpy as np
-import pandas as pd
 
 from utils import *
+from utils.image import *
 from models.utils import *
 from utils.callbacks import *
 from loggers import timer, time_logger
 from utils.keras_utils import TensorSpec, ops
-from utils import plot, load_json, dump_json, get_filename, should_predict, pad_batch
-from utils.distance import dice_coeff, edit_distance
-from utils.text import build_masking_filter
 from utils.image import _image_formats, HTTPScreenMirror, save_image, load_image
 from utils.image.bounding_box import *
+
 from models.interfaces.base_text_model import BaseTextModel
 from models.interfaces.base_image_model import BaseImageModel
 from custom_architectures.current_blocks import set_cudnn_lstm
@@ -84,11 +82,7 @@ class BaseOCR(BaseImageModel, BaseTextModel):
     def infer(self, inputs, training = False, ** kwargs):
         if ops.rank(inputs) == 3: inputs = ops.expand_dims(inputs, axis = 0)
         
-        if hasattr(self.model, 'infer'):
-            kwargs.setdefault('max_length', self.max_output_length)
-        
-            return self.model.infer(inputs, training = training, ** kwargs)
-        return self(inputs, training = training, ** kwargs)
+        return self.compiled_infer(inputs, training = training, ** kwargs)
     
     def compile(self, loss = None, metrics = None, ** kwargs):
         if not loss:
@@ -187,6 +181,7 @@ class BaseOCR(BaseImageModel, BaseTextModel):
             callbacks.append(JSonSaver(
                 data    = predicted,
                 filename    = map_file,
+                force_keys  = {'boxes', 'ocr'},
                 primary_key = 'filename',
                 use_multithreading = use_multithreading
             ))
@@ -233,7 +228,7 @@ class BaseOCR(BaseImageModel, BaseTextModel):
             Arguments :
                 - images  : the image(s) to perform OCR on
                     - str   : the filename of the image
-                    - dict / pd.Series  : informations about the image
+                    - dict  : informations about the image
                         - must contain at least `filename` or `image` + (optional) `boxes`
                     - np.ndarray / Tensor    : the raw image
                     
@@ -455,8 +450,7 @@ class BaseOCR(BaseImageModel, BaseTextModel):
             show_idx = apply_callbacks(results, show_idx, _callbacks)
 
         if join_callbacks:
-            for callback in _callbacks:
-                if isinstance(callback, Callback): callback.join()
+            for callback in _callbacks: callback.join()
 
         return [
             (stored.get('filename', None), out if out else stored)
@@ -470,6 +464,12 @@ class BaseOCR(BaseImageModel, BaseTextModel):
                show = False,
                display  = False,
                max_time = None,
+               buffer_size  = 1,
+               
+               fps  = None,
+               low_fps  = None,
+               high_fps = None,
+               n_fps_change = 5,
                
                detector = 'east',
                
@@ -485,12 +485,12 @@ class BaseOCR(BaseImageModel, BaseTextModel):
                output_shape = None,
 
                callback = None,
-               buffer_size  = 1,
+
                wait_factor  = 0.,
                duplicate_threshold  = 0.9,
-               duplicate_warmup     = 10,
+               duplicate_warmup     = 5,
                duplicate_tolerance  = 5,
-               duplicate_wait_time  = 0.2,
+               duplicate_wait_time  = 0.,
 
                filters  = None,
                region   = [0.2, 0.1, 0.6, 0.95],
@@ -512,38 +512,68 @@ class BaseOCR(BaseImageModel, BaseTextModel):
             'n_skipped'     : 0,
             'n_duplicates'  : 0,
             'warmup_frames' : 0,
+            'high_fps'  : -1,
             'warmup'    : False
         }
-        emitted_texts = set()
+        last_emitted    = []
+        emitted_texts   = set()
         
+        def _maybe_change_fps_mode(index, low = None, high = None):
+            if low_fps is None or high_fps is None: return
+            
+            if low and _state['high_fps'] != -1 and index >= _state['high_fps'] - n_fps_change:
+                set_fps(low_fps)
+                _state['high_fps'] = -1
+                logger.info('Frame #{} : set low fps mode'.format(index))
+            elif high:
+                if _state['high_fps'] == -1:
+                    set_fps(high_fps)
+                    logger.info('Frame #{} : set high fps mode'.format(index))
+                _state['high_fps'] = index
+            
         def _filter_emitted_boxes(boxes, ** _):
             if len(_state['emitted_boxes']) == 0: return list(range(len(boxes)))
             ioa = compute_ioa(boxes, _state['emitted_boxes'], as_matrix = True)
             return np.where(np.any(ioa >= ioa_threshold, axis = 1))[0]
 
         def perform_ocr(image, boxes, output, frame_index, detected = None, ** _):
-            if len(boxes['boxes']) == 0: return
+            if len(boxes['boxes']) == 0:
+                _state.update({
+                    'warmup' : False, 'n_skipped' : _state['n_skipped'] + 1
+                })
+                _maybe_change_fps_mode(frame_index, low = True)
+                return
+            
             if ops.rank(output) == 3: output = output[:, :, 0]
             
             is_duplicate = False
             if _state['prev_output'] is not None:
                 dice = dice_coeff(output, _state['prev_output'])
-                if dice >= duplicate_threshold:
-                    is_duplicate = True
-                    
-                    if _state['warmup']:
-                        _state['warmup_frames'] += 1
-                        if _state['warmup_frames'] > duplicate_warmup: _state['warmup'] = False
-                    else:
-                        _state['n_duplicates'] += 1
-                        if not _is_file_stream and _state['n_duplicates'] % 2 == 0:
-                            time.sleep(duplicate_wait_time)
-
-                        if _state['n_duplicates'] > duplicate_tolerance and _state['n_skipped'] > duplicate_tolerance:
-                            _state['n_skipped'] += 1
-                            return
+                is_duplicate = dice >= duplicate_threshold
             
-            if not is_duplicate:
+            logger.info('Frame #{} : duplicte = {} - high fps : {} - waiting : {}'.format(
+                frame_index, is_duplicate, _state['high_fps'], len(repet_filter)
+            ))
+            if is_duplicate:
+                if _state['warmup']:
+                    if repet_filter is None or len(repet_filter):
+                        _maybe_change_fps_mode(frame_index, high = True)
+                    _state['warmup_frames'] += 1
+                    if _state['warmup_frames'] > duplicate_warmup: _state['warmup'] = False
+                else:
+                    _state['n_duplicates'] += 1
+                    if not _is_file_stream and _state['n_duplicates'] % 2 == 0:
+                        time.sleep(duplicate_wait_time)
+
+                    if _state['n_duplicates'] > duplicate_tolerance and _state['n_skipped'] > duplicate_tolerance:
+                        _state['n_skipped'] += 1
+                        _maybe_change_fps_mode(frame_index, low = True)
+                        return
+            
+            else:
+                if _state['emitted_texts']:
+                    _maybe_change_fps_mode(frame_index, high = True)
+                
                 _state.update({
                     'prev_output'   : output,
                     'n_duplicates'  : 0,
@@ -573,7 +603,7 @@ class BaseOCR(BaseImageModel, BaseTextModel):
                 res['ocr']  = [
                     ocr_res for ocr_res in res['ocr']
                     if _filter_results(
-                        ocr_res, emitted_texts, _state['emitted_texts'], threshold = threshold, ** kwargs
+                        ocr_res, emitted_texts, last_emitted, threshold = threshold, ** kwargs
                     )
                 ]
             
@@ -582,7 +612,7 @@ class BaseOCR(BaseImageModel, BaseTextModel):
                 
                 if not is_empty:
                     logger.info('[SKIP #{}] All results have been filtered !'.format(frame_index))
-                
+
                 return
 
             logger.info('\nFrame #{}'.format(frame_index))
@@ -605,6 +635,7 @@ class BaseOCR(BaseImageModel, BaseTextModel):
                 plot(detected, plot_type = 'imshow')
             
             for ocr_result in res['ocr']:
+                last_emitted.append(ocr_result['text'])
                 _state['emitted_texts'].append(ocr_result['text'])
                 emitted_texts.add(ocr_result['text'])
 
@@ -656,6 +687,7 @@ class BaseOCR(BaseImageModel, BaseTextModel):
         if save_stream is None: save_stream = save and not _is_file_stream
         if save_frames is None: save_frames = save
         if max_time is None:    max_time = 600 if not _is_file_stream else 0
+        if low_fps:     fps = low_fps
         
         if directory is None: directory = self.stream_dir
         if not stream_name:
@@ -681,12 +713,16 @@ class BaseOCR(BaseImageModel, BaseTextModel):
             if region:
                 filters.append(RegionFilter(region = region, mode = 'center'))
             if n_repeat:
-                filters.append(RepetitionFilter(n_repeat = n_repeat, filter_memory = False))
+                filters.append(RepetitionFilter(n_repeat = n_repeat, use_memory = False))
         elif not isinstance(filters, list):
             filters = [filters]
         
         if ioa_threshold:
             filters.append(_filter_emitted_boxes)
+        
+        repet_filter = None
+        if any(isinstance(f, RepetitionFilter) for f in filters):
+            repet_filter = [f for f in filters if isinstance(f, RepetitionFilter)][0]
         
         logits_filter = ops.convert_to_tensor([self.ukn_token_idx], 'int32')
         
@@ -694,7 +730,7 @@ class BaseOCR(BaseImageModel, BaseTextModel):
         if not _is_file_stream and isinstance(stream, str) and stream.startswith('http://192'):
             for _ in range(5):
                 camera = HTTPScreenMirror(stream)
-                ret, frame  = cam.read()
+                ret, frame  = camera.read()
                 if not ret:
                     time.sleep(1)
                 else:
@@ -702,227 +738,34 @@ class BaseOCR(BaseImageModel, BaseTextModel):
                     break
             if not ret: raise RuntimeError('Unable to connect to {} !'.format(stream))
 
-        return detector.stream(
-            camera,
-            show    = show,
-            max_time    = max_time,
-            buffer_size  = buffer_size,
+        try:
+            return detector.stream(
+                camera,
+                fps = fps,
+                show    = show,
+                max_time    = max_time,
+                buffer_size  = buffer_size,
 
-            save    = False,
-            display = False,
-            directory   = directory,
-            stream_name = stream_name,
-            save_stream = save_stream,
-            
-            output_shape = output_shape,
+                save    = False,
+                display = False,
+                directory   = directory,
+                stream_name = stream_name,
+                save_stream = save_stream,
 
-            return_output   = True,
-            post_processing = perform_ocr,
-            
-            ** kwargs
-        )
+                output_shape = output_shape,
 
-    def stream_video(self,
-                     filename   = None,
-                     url    = None,
-                     detector   = 'east',
-                     max_time   = None,
-                     
-                     method = 'beam',
-                     dezoom_factor  = 1.1,
-                     
-                     save   = True,
-                     show   = True,
-                     save_frames    = True,
-                     directory  = None,
-                     output_file    = 'stream-{}.mp4',
-                     output_shape   = None,
-                     
-                     callback   = None,
-                     buffer_size    = 1,
-                     wait_factor    = 0.,
-                     duplicate_tolerance    = 2,
-                     duplicate_wait_time    = 0.2,
-                     
-                     threshold  = -0.2,
-                     region     = [0.25, 0.15, 0.6, 0.95],
-                     n_repeat   = 2,
-                     filters    = None,
-                     ** kwargs
-                    ):
-        ####################
-        #    OCR method    #
-        ####################
-        
-        _state  = {'prev_output' : None, 'n_skipped' : 0, 'n_duplicates' : 0}
-        emitted_texts, last_emitted = set(), []
-        
-        def perform_ocr(detected, image, infos):
-            if len(infos.get('boxes', {}).get('width', ())) == 0: return
-            
-            is_duplicate = False
-            if _state['prev_output'] is not None:
-                dice = dice_coeff(infos['output'], _state['prev_output'])
-                if dice >= 0.9:
-                    is_duplicate = True
-                    
-                    _state['n_skipped'] += 1
-                    _state['n_duplicates'] += 1
-                    if not filename and _state['n_duplicates'] % 2 == 0:
-                        time.sleep(duplicate_wait_time)
-                    
-                    if _state['n_duplicates'] > duplicate_tolerance:
-                        return
-            
-            res = self.predict(
-                {** infos, 'image' : image},
+                return_output   = True,
+                post_processing = perform_ocr,
 
-                method = method,
-                num_sentences     = 1,
-                logits_filter     = logits_filter,
-                dezoom_factor     = dezoom_factor,
-
-                save       = False,
-                display    = False,
-                combine    = True,
-                box_filter = filters,
                 ** kwargs
-            )[0][-1]
+            )
+        finally:
+            for callback in callbacks: callback.join()
 
-            is_empty    = len(res.get('ocr', [])) == 0
-            if not is_empty:
-                res['ocr']  = [
-                    ocr_res for ocr_res in res.get('ocr', [])
-                    if _filter_results(
-                        ocr_res, emitted_texts, last_emitted, threshold = threshold, ** kwargs
-                    )
-                ]
-
-            if len(res.get('ocr', [])) == 0:
-                if not is_duplicate:
-                    _state['n_duplicate'] = 0
-                    _state['n_skipped'] += 1
-                if not is_empty:
-                    logger.info('[SKIP #{}] All results have been filtered !'.format(
-                        infos['frame_index']
-                    ))
-                return
-
-            if not is_duplicate:
-                if _state['n_skipped']:
-                    logger.info('{} frames skipped ({} duplicates)'.format(
-                        _state['n_skipped'], _state['n_duplicates']
-                    ))
-                _state.update({
-                    'n_skipped' : 0, 'n_duplicates' : 0, 'prev_output' : infos['output']
-                })
-
-            logger.info('\nFrame #{}'.format(infos['frame_index']))
-            if show: plot(detected)
-            for ocr_result in res['ocr']:
-                last_emitted.append(ocr_result['text'])
-                emitted_texts.add(ocr_result['text'])
-
-                logger.info('Box  : {}\nScores : {}\nText   : {}'.format(
-                    np.around(convert_box_format(
-                        ocr_result['box'], BoxFormat.XYWH, box_mode = BoxFormat.CORNERS
-                    ), decimals = 3),
-                    np.around(ocr_result['scores'], decimals = 3),
-                    ocr_result['text']
-                ))
-
-                if callback: callback(ocr_result['text'])
-
-                if show:
-                    show_boxes(image, ocr_result['box'], box_mode = ocr_result['box_mode'])
-                    if len(ocr_result['rows']) > 1:
-                        show_boxes(
-                            image,
-                            ocr_result['rows'],
-                            box_mode = ocr_result['box_mode'],
-                            ncols    = len(ocr_result['rows'])
-                        )
-
-            if save_frames:
-                save_image(image = image, filename = os.path.join(
-                    frames_dir, 'frame_{}.jpg'.format(infos['frame_index'])
-                ))
-
-            if wait_factor > 0:
-                time.sleep(
-                    1. + wait_factor * max([len(ocr_res['text']) for ocr_res in res['ocr']])
-                )
-
-
-        ####################
-        #  Initialization  #
-        ####################
-        
-        if isinstance(detector, str):
-            from models import get_pretrained
-            detector = get_pretrained(detector)
-        
-        if callback is not None and not callable(callback):
-            assert hasattr(callback, 'put'), '`callback` must be callable or have a put method !'
-            callback = callback.put
-        
-        if max_time is None: max_time = 600 if not filename else 0
-        
-        if not save: save_frames = False
-        if directory is None: directory = self.stream_dir
-        output_file = os.path.join(directory, output_file)
-        if '{}' in output_file:
-            output_file = output_file.format(len(glob.glob(output_file.replace('{}', '*'))))
-        
-        basename    = os.path.basename(output_file).split('.')[0]
-        frames_dir  = os.path.join(directory, basename) if save_frames else None
-        if save_frames: os.makedirs(frames_dir, exist_ok = True)
-        
-        # Initializes filters
-        if filters is None:
-            filters = [SizeFilter(min_h = 0.025, min_w = 0.1)]
-            if region:
-                filters.append(RegionFilter(region = region, mode = 'center'))
-            if n_repeat:
-                filters.append(RepetitionFilter(n_repeat = n_repeat, filter_memory = False))
-
-        logits_filter = build_masking_filter(indices = self.ukn_token_idx)
-        
-        cam = filename
-        if not filename:
-            for _ in range(5):
-                cam = HTTPScreenMirror(url)
-                ret, frame  = cam.read()
-                if not ret:
-                    time.sleep(1)
-                else:
-                    output_shape    = frame.shape[:2]
-                    break
-            if not ret: raise RuntimeError('Unable to connect to {} !'.format(url))
-
-        if not save: output_file = None
-        detector.stream(
-            cam_id   = cam,
-            show     = False,
-            max_time    = max_time,
-            buffer_size  = buffer_size,
-
-            output_file  = output_file,
-            output_shape = output_shape,
-
-            save      = False,
-            verbose   = False,
-            display   = False,
-
-            return_output   = True,
-            post_processing = perform_ocr,
-            ** kwargs
-        )
-        logger.info('Stream finished and saved to {} !'.format(output_file))
-        return output_file
-
-    def get_config(self, * args, ** kwargs):
-        config = super().get_config(* args, ** kwargs)
+    stream_video = stream
+    
+    def get_config(self):
+        config = super().get_config()
         config.update({
             ** self.get_config_image(),
             ** self.get_config_text(),
