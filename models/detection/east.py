@@ -1,5 +1,5 @@
-# Copyright (C) 2022-now yui-mhcp project author. All rights reserved.
-# Licenced under a modified Affero GPL v3 Licence (the "Licence").
+# Copyright (C) 2025-now yui-mhcp project author. All rights reserved.
+# Licenced under the Affero GPL v3 Licence (the "Licence").
 # you may not use this file except in compliance with the License.
 # See the "LICENCE" file at the root of the directory for the licence information.
 #
@@ -12,9 +12,9 @@
 import numpy as np
 
 from loggers import timer
+from utils.image import nms
+from utils.keras import TensorSpec, ops
 from .base_detector import BaseDetector
-from utils.keras_utils import TensorSpec, ops
-from utils.image.bounding_box import nms, restore_polys_from_map
 
 class EAST(BaseDetector):
     _default_loss   = 'EASTLoss'
@@ -61,24 +61,18 @@ class EAST(BaseDetector):
     def use_labels(self):
         return self.nb_class > 1
     
-    @property
-    def training_hparams(self):
-        return super().training_hparams(
-            min_poly_size   = 6,
-            max_wh_factor   = 5,
-            shrink_ratio    = 0.1
-        )
-    
     @timer
     def decode_output(self,
                       output,
-                      inputs    = None,
+                      inputs,
                       normalize = True,
                       nms_method    = 'lanms',
                       nms_threshold = None,
                       obj_threshold = None,
                       ** kwargs
                      ):
+        from utils import plot
+        
         if obj_threshold is None: obj_threshold = self.obj_threshold
         if nms_threshold is None: nms_threshold = self.nms_threshold
         
@@ -88,22 +82,108 @@ class EAST(BaseDetector):
             score_map   = output[..., :1],
             geo_map     = output[..., 1:5] * 512,
             theta_map   = (output[..., 5:6] - 0.5) * np.pi,
+            
             normalize   = normalize,
             threshold   = obj_threshold,
-            scale   = np.array(inputs.shape[1:-1]) // np.array(output.shape[1:-1]),
-            ** kwargs
+            input_shape = np.array(inputs.shape[1:-1]),
+            output_shape    = np.array(output.shape[:-1])
         )
-        if nms_threshold < 1.:
-            results = [
-                nms(b, method = nms_method, ** kwargs) for b in boxes
-            ]
-            boxes = [
-                nms_boxes[0][mask[0]] if len(nms_boxes) > 0 else nms_boxes
-                for nms_boxes, _, mask in results
-            ]
-            boxes = [{'boxes' : b, 'format' : 'xyxy'} for b in boxes]
+        if nms_threshold < 1. and len(boxes['boxes']):
+            boxes, _, mask = nms(boxes, method = nms_method, nms_threshold = nms_threshold, ** kwargs)
+            boxes = {'boxes' : boxes[mask], 'format' : 'xyxy'}
         
         return boxes
     
     def get_output(self, data, ** kwargs):
         raise NotImplementedError()
+
+""" These functions are inspired from https://github.com/SakuraRiven/EAST """
+
+@timer
+def restore_polys_from_map(score_map,
+                           geo_map,
+                           theta_map,
+                           input_shape,
+                           output_shape,
+                           *,
+                           
+                           normalize    = True,
+                           threshold    = 0.5
+                          ):
+    if len(score_map.shape) == 4:
+        return [restore_polys_from_map(
+            score_map   = s_map,
+            geo_map     = g_map,
+            theta_map   = t_map,
+            input_shape = input_shape,
+            output_shape    = output_shape,
+            
+            normalize   = normalize,
+            threshold   = threshold
+        ) for s_map, g_map, t_map in zip(score_map, geo_map, theta_map)]
+    
+    if len(score_map.shape) == 3:
+        score_map   = score_map[:, :, 0]
+        theta_map   = theta_map[:, :, 0]
+    
+    # filter the score map
+    points = np.argwhere(score_map > threshold)
+
+    # sort the text boxes via the y axis
+    points  = points[np.argsort(points[:, 0])]
+    scores  = score_map[points[:, 0], points[:, 1]]
+    # restore
+    valid_polys, valid_indices = restore_polys(
+        points[:, ::-1],
+        geo_map[points[:, 0], points[:, 1]],
+        theta_map[points[:, 0], points[:, 1]],
+        input_shape,
+        output_shape
+    )
+    scores  = scores[valid_indices]
+    
+    if normalize:
+        input_shape_wh  = input_shape[::-1].reshape(1, 1, 2)
+        valid_polys     = (valid_polys / input_shape_wh).astype(np.float32)
+
+    return {
+        'boxes' : valid_polys, 'scores' : scores, 'format' : 'poly'
+    }
+
+@timer
+def restore_polys(pos, d, angle, input_shape, output_shape):
+    scale   = input_shape // output_shape
+    pos     = pos * scale[None]
+
+    x, y    = pos[:, 0], pos[:, 1]
+    
+    y_min, y_max    = y - d[:, 0], y + d[:, 1]
+    x_min, x_max    = x - d[:, 2], x + d[:, 3]
+
+    rotate_mat  = get_rotation_matrix(- angle)
+
+    temp_x      = np.array([[x_min, x_max, x_max, x_min]]) - x
+    temp_y      = np.array([[y_min, y_min, y_max, y_max]]) - y
+    coordinates = np.concatenate((temp_x, temp_y), axis = 0)
+
+    res = np.matmul(
+        np.transpose(coordinates, [2, 1, 0]),
+        np.transpose(rotate_mat, [2, 1, 0])
+    )
+    res[:, :, 0] += x[:, np.newaxis]
+    res[:, :, 1] += y[:, np.newaxis]
+
+    mask = filter_polys(res, input_shape)
+
+    return res[mask], np.argwhere(mask)[:, 0]
+
+def get_rotation_matrix(theta):
+    return np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]])
+
+def filter_polys(res, input_shape):
+    input_shape = input_shape[::-1][None, None, :]
+    return np.count_nonzero(
+        np.any(res < 0, axis = -1) | np.any(res >= input_shape, axis = -1), axis = -1
+    ) <= 1
+
+

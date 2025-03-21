@@ -1,5 +1,5 @@
-# Copyright (C) 2022-now yui-mhcp project author. All rights reserved.
-# Licenced under a modified Affero GPL v3 Licence (the "Licence").
+# Copyright (C) 2025-now yui-mhcp project author. All rights reserved.
+# Licenced under the Affero GPL v3 Licence (the "Licence").
 # you may not use this file except in compliance with the License.
 # See the "LICENCE" file at the root of the directory for the licence information.
 #
@@ -11,14 +11,19 @@
 
 import os
 import logging
+import importlib
 
-from utils import import_objects
-from models.utils import get_models, get_model_config, is_model_name
+from utils import setup_environment
+from ..interfaces import BaseModel
 
-_detection_models = import_objects(
-    __package__.replace('.', os.path.sep), allow_functions = False
-)
-globals().update(_detection_models)
+for module in os.listdir(__package__.replace('.', os.path.sep)):
+    if module.startswith(('.', '_')) or '_old' in module: continue
+    module = importlib.import_module(__package__ + '.' + module[:-3])
+    
+    globals().update({
+        k : v for k, v in vars(module).items() if isinstance(v, type) and issubclass(v, BaseModel)
+    })
+
 
 logger = logging.getLogger(__name__)
 
@@ -40,15 +45,14 @@ def get_model(label = None, model = None, ** kwargs):
     if model is None:
         raise ValueError('No model found for label {}'.format(model, label))
     elif isinstance(model, str):
-        if not is_model_name(model):
-            raise ValueError('Model {} does not exist !'.format(model))
         model = get_pretrained(model, ** kwargs)
     
     return model
     
 
-def stream(*, label = None, model = None, ** kwargs):
-    return get_model(label = label, model = model, ** kwargs).stream(** kwargs)
+def stream(stream, *, label = None, model = None, ** kwargs):
+    setup_environment(** kwargs)
+    return get_model(label = label, model = model, ** kwargs).stream(stream, ** kwargs)
 
 def detect(images, *, label = None, model = None, ** kwargs):
     return get_model(label = label, model = model, ** kwargs).predict(images, ** kwargs)

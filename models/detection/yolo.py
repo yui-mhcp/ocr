@@ -1,5 +1,5 @@
-# Copyright (C) 2022-now yui-mhcp project author. All rights reserved.
-# Licenced under a modified Affero GPL v3 Licence (the "Licence").
+# Copyright (C) 2025-now yui-mhcp project author. All rights reserved.
+# Licenced under the Affero GPL v3 Licence (the "Licence").
 # you may not use this file except in compliance with the License.
 # See the "LICENCE" file at the root of the directory for the licence information.
 #
@@ -14,9 +14,9 @@ import logging
 import numpy as np
 
 from utils import download_file
-from loggers import timer, time_logger
-from utils.keras_utils import TensorSpec, execute_eagerly
-from utils.image.bounding_box import *
+from loggers import Timer, timer
+from utils.image.bounding_box import compute_iou
+from utils.keras import TensorSpec, ops, execute_eagerly
 from .base_detector import BaseDetector
 
 logger = logging.getLogger(__name__)
@@ -40,7 +40,9 @@ class YOLO(BaseDetector):
     _default_loss   = 'YoloLoss'
     
     def __init__(self,
-                 * args,
+                 labels,
+                 *,
+                 
                  max_box_per_image  = 100,
                  
                  input_size = 416,
@@ -59,11 +61,11 @@ class YOLO(BaseDetector):
 
         self.np_anchors = np.array(anchors).reshape(-1, 2)
         
-        super().__init__(* args, input_size = input_size, nb_class = nb_class, ** kwargs)
+        super().__init__(labels = labels, input_size = input_size, nb_class = nb_class, ** kwargs)
             
     def build(self, flatten = True, randomize = False, model = None, ** kwargs):
         if model is None:
-            from custom_architectures import get_architecture
+            from architectures import get_architecture
             
             feature_extractor = get_architecture(
                 architecture    = self.backend,
@@ -123,7 +125,7 @@ class YOLO(BaseDetector):
         )
 
     @execute_eagerly(Tout = ('float32', 'float32'), numpy = True)
-    def get_output(self, boxes, labels, nb_box, image_h, image_w, ** kwargs):
+    def get_output(self, boxes, labels, nb_box, image_h, image_w):
         output      = np.zeros(
             (self.grid_h, self.grid_w, self.nb_box, 5 + self.nb_class), dtype = np.float32
         )
@@ -185,16 +187,13 @@ class YOLO(BaseDetector):
             ]
         )
     
-    def get_config(self, * args, ** kwargs):
-        config = super().get_config(* args, ** kwargs)
-        config.update({
-            ** self.get_config_image(),
+    def get_config(self):
+        return {
+            ** super().get_config(),
             'anchors'   : self.anchors,
             'backend'   : self.backend,
             'max_box_per_image' : self.max_box_per_image
-        })
-        
-        return config
+        }
 
     @classmethod
     def from_darknet_pretrained(cls,
@@ -226,13 +225,13 @@ def decode_output(output, *, obj_threshold = 0.35, nms_threshold = 0.2, labels =
         })
         return [decode_output(out, ** kwargs) for out in output]
     
-    with time_logger.timer('init'):
+    with Timer('init'):
         grid_h, grid_w, nb_box = output.shape[:3]
         nb_class = output.shape[3] - 5
         
         scores  = output[..., 5:] * output[..., 4:5]
 
-    with time_logger.timer('box selection'):
+    with Timer('box selection'):
         candidates = np.where(np.max(scores, axis = -1) > obj_threshold)
 
         pos    = output[..., :4][candidates]
@@ -247,7 +246,7 @@ def decode_output(output, *, obj_threshold = 0.35, nms_threshold = 0.2, labels =
         classes  = scores[valids]
 
     # suppress non-maximal boxes
-    with time_logger.timer('NMS'):
+    with Timer('NMS'):
         ious = {}
         for c in range(nb_class):
             scores_c = classes[:, c]
