@@ -19,7 +19,7 @@ from functools import cached_property, partialmethod
 
 from loggers import Timer, timer
 from utils import JSONSaver, Stream, dump_json, load_json, time_to_string, copy_methods
-from utils.keras import TensorSpec, ops, graph_compile, _runtimes
+from utils.keras import TensorSpec, ops, build_runtime, graph_compile
 from utils.datasets import prepare_dataset, summarize_dataset
 from custom_train_objects import CheckpointManager, History
 
@@ -181,21 +181,13 @@ class BaseModel(metaclass = ModelInstances):
             with Timer('{} restoration'.format(runtime), debug = True):
                 if runtime == 'keras':
                     self._restore_model()
-                elif runtime in _runtimes:
-                    self.model = _runtimes[runtime](** kwargs)
                 else:
-                    raise ValueError('Unknown runtime\n  Accepted : {}\n  Got : {}'.format(
-                        ('keras', ) + tuple(_runtimes.keys()), runtime
-                    ))
+                    self.model = build_runtime(runtime, ** kwargs)
         else:
             if runtime == 'keras':
                 self.build(** kwargs)
-            elif runtime in _runtimes:
-                self.model = _runtimes[runtime](** kwargs)
             else:
-                raise ValueError('Unknown runtime\n  Accepted : {}\n  Got : {}'.format(
-                    ('keras', ) + tuple(_runtimes.keys()), runtime
-                ))
+                self.model = build_runtime(runtime, ** kwargs)
         
             if save and not os.path.exists(self.config_file):
                 self._init_directories()
@@ -211,6 +203,9 @@ class BaseModel(metaclass = ModelInstances):
         else:
             self.get_output = self._get_output
             
+        self._compiled_call = None
+        self._compiled_infer    = None
+        
         logger.info("{} `{}` initialized successfully !".format(self.__class__.__name__, self.name))
     
     @timer(debug = True)
@@ -309,6 +304,22 @@ class BaseModel(metaclass = ModelInstances):
             self.__checkpoint_manager = CheckpointManager(self, max_to_keep = self.max_to_keep)
         return self.__checkpoint_manager
     
+    @property
+    def default_metrics_config(self):
+        return {}
+    
+    @property
+    def default_loss_config(self):
+        return {}
+    
+    @property
+    def training_hparams(self):
+        return {'augment_prct' : 0.25} if hasattr(self, 'augment_data') else {}
+    
+    @property
+    def training_hparams_mapper(self):
+        return {}
+
     @cached_property
     def call_signature(self):
         fn = getattr(self.model, 'call', self.model.__call__)
@@ -344,8 +355,17 @@ class BaseModel(metaclass = ModelInstances):
         return config
 
     @property
+    def compiled_call(self):
+        if self._compiled_call is None:
+            if self.runtime != 'keras':
+                self._compiled_call = self.model
+            else:
+                self._compiled_call = graph_compile(self.model, ** self.graph_compile_config)
+        return self._compiled_call
+
+    @property
     def compiled_infer(self):
-        if getattr(self, '_compiled_infer', None) is None:
+        if self._compiled_infer is None:
             if self.runtime != 'keras':
                 self._compiled_infer = self.model
             elif hasattr(self.model, 'infer'):
@@ -353,22 +373,6 @@ class BaseModel(metaclass = ModelInstances):
             else:
                 self._compiled_infer = graph_compile(self.model, ** self.infer_compile_config)
         return self._compiled_infer
-
-    @property
-    def default_metrics_config(self):
-        return {}
-    
-    @property
-    def default_loss_config(self):
-        return {}
-    
-    @property
-    def training_hparams(self):
-        return {'augment_prct' : 0.25} if hasattr(self, 'augment_data') else {}
-    
-    @property
-    def training_hparams_mapper(self):
-        return {}
     
     def __str__(self):
         des = "\n========== {} ==========\n".format(self.name)
@@ -781,6 +785,10 @@ class BaseModel(metaclass = ModelInstances):
     def _restore_model_old(self, config, compile = False, ** kwargs):
         import keras
         
+        from architectures import get_custom_objects
+        from custom_train_objects.losses import get_loss
+        from custom_train_objects.metrics import get_metrics
+        
         _load_weights   = True
         
         if len(config['models']) > 1:
@@ -806,7 +814,9 @@ class BaseModel(metaclass = ModelInstances):
                 model_config
             )
             
-            self.model = keras.saving.deserialize_keras_object(model_config)
+            self.model = keras.saving.deserialize_keras_object(
+                model_config, custom_objects = get_custom_objects()
+            )
         elif os.path.exists(filename.replace('.keras', '.json')):
             filename = filename.replace('.keras', '.json')
 

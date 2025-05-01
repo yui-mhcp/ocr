@@ -99,7 +99,8 @@ class TransformerTokenEmbedding(keras.layers.Layer):
         # Set token embedding layer
         if token_embedding is None:
             token_embedding = CustomEmbedding(
-                self.vocab_size, self.embedding_dim, name = 'token_embedding'
+                self.vocab_size, self.embedding_dim, name = 'token_embedding',
+                embeddings_initializer = 'zeros'
             )
         
         self.token_embedding_layer = token_embedding
@@ -127,6 +128,7 @@ class TransformerTokenEmbedding(keras.layers.Layer):
         ) if self.hparams.drop_rate > 0. else None
 
     def build(self, input_shape):
+        super().build(input_shape)
         self.token_embedding_layer.build((None, None))
         if self.pos_embedding_layer is not None:
             self.pos_embedding_layer.build((None, None))
@@ -134,7 +136,6 @@ class TransformerTokenEmbedding(keras.layers.Layer):
             self.token_type_embedding_layer.build((None, None))
         if self.norm is not None:
             self.norm.build((None, None, self.embedding_dim))
-        super().build(input_shape)
         
     def change_vocabulary(self, vocab, ** kwargs):
         self.vocab_size = len(vocab)

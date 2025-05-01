@@ -22,7 +22,7 @@ _token_indexes  = [tok_name + '_idx' for tok_name in _tokens]
 @copy_methods(
     'tokenizer', 'vocab', 'vocab_size', 'template', * _tokens, * _token_indexes, 'clean_text',
     ** {name + '_text' : name for name in ('encode', 'decode', 'ctc_decode', 'format')},
-    chat_template = 'template', encode_chat = 'encode_template',
+    chat_template = 'template', encode_chat = 'encode_chat',
     type    = Tokenizer
 )
 class BaseTextModel(BaseModel):
@@ -77,8 +77,9 @@ class BaseTextModel(BaseModel):
         
         # Most common case first
         if use_template and self.is_chat_model:
+            assert not format, '`format` is not supported for chat models. Please apply the formatting before `prepare_text`'
             if not isinstance(data, dict): data = {'text' : data}
-            return self.encode_chat(format = format, ** {** kwargs, ** data})
+            return self.encode_chat(** {** kwargs, ** data})
         elif format:
             if not isinstance(data, dict): data = {'text' : data}
             data = format_text(format, ** data)

@@ -21,7 +21,7 @@ from .simple_models import classifier, perceptron, simple_cnn
 
 for module in os.listdir(__package__.replace('.', os.path.sep)):
     if module.startswith(('.', '_')) or '_old' in module: continue
-    elif '_arch' not in module: continue
+    elif '_arch' not in module and module != 'transformers': continue
     module = importlib.import_module(__package__ + '.' + module.replace('.py', ''))
     
     globals().update({
