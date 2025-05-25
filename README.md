@@ -64,7 +64,7 @@ Available architectures :
 | Classes   | Dataset   | Architecture  | Trainer   | Weights   |
 | :-------: | :-------: | :-----------: | :-------: | :-------: |
 
-Models must be unzipped in the `pretrained_models/` directory!
+Models should be unzipped in the `pretrained_models/` directory!
 
 The pretrained `CRNN` models come from the [EasyOCR](https://github.com/JaidedAI/EasyOCR) library. Weights are automatically downloaded given the language or the model name, and converted to `keras`! The `easyocr` library is therefore not required, while `pytorch` is required for weights loading (for conversion).
 

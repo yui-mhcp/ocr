@@ -180,7 +180,7 @@ class BaseOCR(BaseImageModel, BaseTextModel):
                         dezoom_factor = dezoom_factor
                     )
                     if any(s == 0 for s in inp.shape):
-                        logger.info('Invalid input encountered : {}'.format(inp.shape))
+                        logger.warning('Invalid input encountered : {}'.format(inp.shape))
                         continue
                     
                     out = self.compiled_infer(
@@ -561,8 +561,6 @@ class BaseOCR(BaseImageModel, BaseTextModel):
         def _filter_emitted_boxes(boxes, ** _):
             if self._stream_state.last_boxes is None: return list(range(len(boxes)))
             ioa = compute_ioa(boxes, self._stream_state.last_boxes, as_matrix = True, source = 'xyxy')
-            print('IoA filtering :')
-            print(np.around(ioa, 3))
             return np.where(np.all(ioa < ioa_threshold, axis = 1))[0]
 
 
