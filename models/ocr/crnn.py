@@ -31,7 +31,7 @@ class CRNN(BaseOCR):
             kwargs.setdefault('image_normalization', 'easyocr')
             kwargs.setdefault('tokenizer', {})
             if isinstance(kwargs['tokenizer'], dict) and 'vocab' not in kwargs['tokenizer']:
-                kwargs['text_encoder'].update({
+                kwargs['tokenizer'].update({
                     'vocab' : vocab,
                     'level' : 'char',
                     'pad_token' : '<blank>'
