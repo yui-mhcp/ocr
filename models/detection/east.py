@@ -23,44 +23,37 @@ class EAST(BaseDetector):
                  * args,
                  image_normalization    = 'east',
                  resize_kwargs  = {'antialias' : True},
+                 geo_scale  = 512,
                  ** kwargs
                 ):
+        # `geo_scale` : the pixel scale the RBOX geometry map was trained with (see `decode_output`)
+        self.geo_scale  = geo_scale
         super().__init__(
             * args,
             resize_kwargs   = resize_kwargs,
             image_normalization = image_normalization,
             ** kwargs
         )
-    
+
     def build(self, architecture = 'EASTVGG', model = None, ** kwargs):
         if model is None:
+            # `EASTVGG` builds fixed heads : score (1) + geo (4) + angle (1) = 6 channels.
+            # EAST is text-only (mono-class), so there is no class map.
             model = {
                 'architecture'  : architecture,
                 'input_shape'   : self.input_size,
-                'output_dim'    : [1, 4, 1] + ([self.nb_class] if self.use_labels else []),
-                'final_activation'  : ['sigmoid', 'sigmoid', 'sigmoid', 'softmax'],
-                'final_name'    : ['score_map', 'geo_map', 'theta_map', 'class_map'],
                 ** kwargs
             }
         return super().build(model = model)
-    
+
     @property
     def output_signature(self):
-        sign = (
+        return (
             TensorSpec(shape = (None, ) + self.input_size[:-1], dtype = 'float32'),
             TensorSpec(shape = (None, ) + self.input_size[:-1] + (5, ), dtype = 'float32'),
             TensorSpec(shape = (None, ) + self.input_size[:-1], dtype = 'bool'),
         )
-        if self.use_labels:
-            sign += (
-                TensorSpec(shape = (None, ) + self.input_size[:-1] + (1, ), dtype = 'int32'), 
-            )
-        return sign
-    
-    @property
-    def use_labels(self):
-        return self.nb_class > 1
-    
+
     @timer
     def decode_output(self,
                       output,
@@ -71,31 +64,36 @@ class EAST(BaseDetector):
                       obj_threshold = None,
                       ** kwargs
                      ):
-        from utils import plot
-        
         if obj_threshold is None: obj_threshold = self.obj_threshold
         if nms_threshold is None: nms_threshold = self.nms_threshold
-        
+
         output  = ops.convert_to_numpy(output)
-        
+
         boxes = restore_polys_from_map(
             score_map   = output[..., :1],
-            geo_map     = output[..., 1:5] * 512,
+            geo_map     = output[..., 1:5] * self.geo_scale,
             theta_map   = (output[..., 5:6] - 0.5) * np.pi,
-            
+
             normalize   = normalize,
             threshold   = obj_threshold,
             input_shape = np.array(inputs.shape[1:-1]),
             output_shape    = np.array(output.shape[:-1])
         )
-        if nms_threshold < 1. and len(boxes['boxes']):
-            boxes, _, mask = nms(boxes, method = nms_method, nms_threshold = nms_threshold, ** kwargs)
-            boxes = {'boxes' : boxes[mask], 'format' : 'xyxy'}
-        
+        # keep the output `format` consistent whether or not any box was detected
+        if not len(boxes['boxes']):
+            return {'boxes' : np.zeros((0, 4), dtype = np.float32), 'scores' : boxes['scores'], 'format' : 'xyxy'}
+
+        if nms_threshold < 1.:
+            nms_boxes, nms_scores, mask = nms(boxes, method = nms_method, nms_threshold = nms_threshold, ** kwargs)
+            boxes = {'boxes' : nms_boxes[mask], 'scores' : nms_scores[mask], 'format' : 'xyxy'}
+
         return boxes
-    
+
     def get_output(self, data, ** kwargs):
         raise NotImplementedError()
+
+    def get_config(self):
+        return {** super().get_config(), 'geo_scale' : self.geo_scale}
 
 """ These functions are inspired from https://github.com/SakuraRiven/EAST """
 
@@ -152,6 +150,8 @@ def restore_polys_from_map(score_map,
 
 @timer
 def restore_polys(pos, d, angle, input_shape, output_shape):
+    # the FCN stride is isotropic (same in H and W), so `scale[0] == scale[1]` and the
+    # (x, y) / (H, W) axis order is irrelevant here — this maps grid coords back to input pixels
     scale   = input_shape // output_shape
     pos     = pos * scale[None]
 
@@ -185,5 +185,3 @@ def filter_polys(res, input_shape):
     return np.count_nonzero(
         np.any(res < 0, axis = -1) | np.any(res >= input_shape, axis = -1), axis = -1
     ) <= 1
-
-

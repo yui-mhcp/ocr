@@ -14,24 +14,22 @@ import numpy as np
 
 from functools import partial
 
-from utils import Stream, contains_index_format, format_path_index
+from utils import contains_index_format, format_path_index
 from loggers import timer
 from utils.keras import ops
 from utils.callbacks import *
-from utils.image import stream_camera, draw_boxes
-from ..interfaces.base_model import BaseModel
-from ..interfaces.base_image_model import BaseImageModel
-from ..interfaces.base_classification_model import BaseClassificationModel
+from utils.image import stream_camera, draw_boxes, mask_boxes
+from ..core import BaseModel, ImageModelMixin, ClassificationModelMixin
 
-class BaseDetector(BaseClassificationModel, BaseImageModel):
+class BaseDetector(ClassificationModelMixin, ImageModelMixin, BaseModel):
     _directories    = {
         ** BaseModel._directories, 'stream_dir' : '{root}/{self.name}/stream'
     }
-    
-    input_signature = BaseImageModel.image_signature
-    
-    prepare_input   = BaseImageModel.get_image
-    process_input   = BaseImageModel.process_image
+
+    input_signature = ImageModelMixin.image_signature
+
+    prepare_input   = ImageModelMixin.get_image
+    process_input   = ImageModelMixin.process_image
     
     def decode_output(self, model_output, ** kwargs):   raise NotImplementedError()
     def prepare_output(self, data, ** kwargs):          raise NotImplementedError()
@@ -49,37 +47,54 @@ class BaseDetector(BaseClassificationModel, BaseImageModel):
         return super().__str__() + self._str_image() + self._str_labels()
 
     @timer(name = 'inference')
-    def infer(self, image, *, predicted = None, overwrite = False, ** kwargs):
+    def infer(self,
+              image,
+              *,
+              callbacks = None,
+              predicted = None,
+              overwrite = False,
+              return_output = True,
+              ** kwargs
+             ):
         """
             Arguments :
-                - inputs    : `Tensor` of rank 3 or 4 (single / batched image(s))
-                - kwargs    : forwarded to `decode_output` if `get_boxes = True`
+                - image     : the input image (filename, raw image, or `dict` with extra infos)
+                - callbacks / predicted / overwrite / return_output : see `BaseModel.infer`
+                - kwargs    : forwarded to `compiled_infer` and `decode_output`
             Return :
                 - output    : `dict` containing the following entries
                               - filename    : `str`, the input image file (if provided)
                               - image       : `np.ndarray`, the raw loaded unprocessed image
                               - boxes       : `dict` with the `boxes`, `format` and `scores` entries
                               - output  : `Tensor`, the model output
-            
+
             Note : depending whether `image` is a filename already in `predicted`, some keys in the output may be missing (notably `output` and `image`)
-                
+
         """
         if predicted and not overwrite and isinstance(image, str) and image in predicted:
-            return predicted[image]
+            return self._finalize_cached_prediction(
+                image, callbacks = callbacks, predicted = predicted
+            )
 
         infos = image.copy() if isinstance(image, dict) else {}
-        
+
         filename, image = self.get_image_data(image)
         inputs  = self.get_input(image)
         if ops.rank(inputs) == 3:    inputs = inputs[None]
-        
+
         output = self.compiled_infer(inputs, ** kwargs)[0]
-        
+
         boxes = self.decode_output(output, inputs = inputs, ** kwargs)
-        return {
+        output = {
             ** infos, 'filename' : filename, 'boxes' : boxes, 'image' : image, 'output' : output
         }
-    
+        return self._finalize_predictions(
+            output, callbacks = callbacks, predicted = predicted, return_output = return_output
+        )
+
+    def filter_prediction_output(self, output):
+        return {k : v for k, v in output.items() if 'image' not in k and k != 'output'}
+
     @timer(name = 'drawing')
     def draw_prediction(self, *, boxes, image = None, filename = None, as_mask = False, ** kwargs):
         """ Calls `draw_boxes` or `mask_boxes` depending on `as_mask` and returns the result """
@@ -153,14 +168,16 @@ class BaseDetector(BaseClassificationModel, BaseImageModel):
                                       * frame_index : the frame index in a stream (`int`)
                                       Entries with "*" are conditionned and are not always provided
                 
-                - use_multithreading    : whether to multi-thread the saving callbacks
-                
+                - save_in_parallel  : whether to run the saving callbacks in parallel threads
+
                 - kwargs    : mainly ignored
             Return : (predicted, required_keys, callbacks)
                 - predicted : the mapping `{filename : infos}` stored in `{directory}/map.json`
-                - required_keys : expected keys to save (see `models.utils.should_predict`)
+                - required_keys : expected keys to save (see `models.core.utils.should_predict`)
                 - callbacks : the list of `Callback` to be applied on each prediction
         """
+        # `display` doubles as the `max_display` count of the display callbacks (a truthy
+        # bool is a valid count of 1), hence the `bool` / `int` dual use below
         if display is None:         display = not save and not save_detected
         if save_detected is None:   save_detected = save
         elif save_detected:         save = True
@@ -233,45 +250,9 @@ class BaseDetector(BaseClassificationModel, BaseImageModel):
         
         return predicted, callbacks
     
-    @timer
-    def predict(self,
-                inputs,
-                *,
-                
-                predicted = None,
-                callbacks = None,
-                
-                return_results  = True,
-                return_output   = None,
-                
-                ** kwargs
-               ):
-        if (isinstance(inputs, (str, dict))) or (ops.is_array(inputs) and len(inputs.shape) == 3):
-            inputs = [inputs]
-        
-        join_callbacks = predicted is None
-        if predicted is None:
-            predicted, callbacks = self.get_inference_callbacks(** kwargs)
-        
-        if return_output is None:
-            return_output = not any(isinstance(callback, JSONSaver) for callback in callbacks)
-        
-        results = []
-        for image, output in Stream(self.infer, inputs, predicted = predicted, ** kwargs).items():
-            infos = {k : v for k, v in output.items() if 'image' not in k and k != 'output'}
-            
-            entry = apply_callbacks(callbacks, infos, output, save = 'image' in output)
-            if entry is None: entry = output.get('filename', None)
-            
-            if return_results:
-                results.append(
-                    output if return_output or entry is None else predicted.get(entry, None)
-                )
-        
-        if join_callbacks:
-            for callback in callbacks: callback.join()
-        
-        return results
+    def _normalize_prediction_inputs(self, inputs):
+        if ops.is_array(inputs) and len(inputs.shape) == 3: return [inputs]
+        return super()._normalize_prediction_inputs(inputs)
 
     @timer
     def stream(self,
@@ -381,12 +362,11 @@ class BaseDetector(BaseClassificationModel, BaseImageModel):
         predicted, callbacks = self.get_inference_callbacks(** kwargs)
         
         def detection(img):
+            # `infer` applies the callbacks itself ; the `initializer`s (e.g. `detected`)
+            # enrich `output` in-place, so the drawn frame is available right after
             output = self.infer(
-                img, predicted = predicted, ** kwargs
+                img, callbacks = callbacks, predicted = predicted, ** kwargs
             )
-            infos = {k : v for k, v in output.items() if 'image' not in k and k != 'output'}
-            
-            apply_callbacks(callbacks, infos, output, save = True)
 
             if not show and not save_transformed:
                 return None
@@ -414,4 +394,3 @@ class BaseDetector(BaseClassificationModel, BaseImageModel):
             'obj_threshold' : self.obj_threshold,
             'nms_threshold' : self.nms_threshold
         }
-

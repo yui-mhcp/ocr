@@ -1,0 +1,136 @@
+[build-system]
+# >= 77 for PEP 639 SPDX `license` expressions
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "yui-ocr"
+# Single-sourced from `__version__.py` — see [tool.setuptools.dynamic] below.
+dynamic = ["version"]
+description = "Optical Character Recognition toolkit combining scene-text detection (EAST) and recognition (CRNN), built on the `BaseModel` interface with keras-free runtimes"
+readme = "README.md"
+# Pinned to 3.12: like base_dl_project, this project needs a real keras backend
+# (tensorflow / torch), and the backend wheels are what pin a full workstation to
+# 3.12 — see INSTALLATION.md.
+requires-python = "==3.12.*"
+license = "AGPL-3.0-or-later"
+license-files = ["LICENCE"]
+authors = [{ name = "yui", email = "yui-mhcp@tutanota.com" }]
+keywords = ["deep-learning", "keras", "ocr", "text-detection", "text-recognition", "crnn", "east", "tensorrt"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Operating System :: OS Independent",
+]
+
+# Common `import utils` / `import loggers` / `import models` socle (eager + lazy).
+# Deliberately free of keras / tensorflow / torch — pick a backend via the [tf] / [torch] extra.
+# The image and text stacks are *core* here: OCR = scene-text detection (EAST, on images)
+# + recognition (CRNN, needs text cleaning / tokenization), so both are required to run.
+dependencies = [
+    "numpy",
+    "tqdm",             # utils/file_utils.py
+    "pyyaml",           # utils/file_utils.py
+    "matplotlib",       # utils/plot_utils.py, re-exported by utils/__init__.py
+    "requests",         # loggers/telegram_handler.py
+    "h5py",             # utils/file_utils.py: hdf5 load/dump
+    "msgspec",          # utils/file_utils.py: fast json (guarded by try/except)
+    "scikit-learn",     # utils/plot_utils.py + utils/datasets/builder.py
+    "umap-learn",       # utils/plot_utils.py: embeddings projection
+    # --- image (core: image I/O + processing for detection / OCR) ------------
+    "pillow",
+    "opencv-python",
+    "ffmpeg-python",
+    "imageio",
+    "networkx",
+    "ipython",
+    # --- text (core: cleaning / tokenization for the CRNN recognition head) --
+    "regex",
+    "unidecode",
+    "num2words",
+]
+
+[project.urls]
+Homepage = "https://github.com/yui-mhcp"
+Repository = "https://github.com/yui-mhcp/ocr"
+Changelog = "https://github.com/yui-mhcp/ocr/blob/main/CHANGELOG.md"
+Issues = "https://github.com/yui-mhcp/ocr/issues"
+
+[project.optional-dependencies]
+datasets = [
+    "pandas",
+    "tensorflow-datasets",
+]
+
+# --- keras backends (mutually exclusive: pick the one matching your setup) ----
+# NOTE: the pretrained CRNN (EasyOCR) and EAST (SakuraRiven) weights are stored as
+# torch checkpoints — `torch` is required to convert them regardless of the keras
+# backend you pick (see the README).
+torch = [
+    "keras>=3",
+    "torch",
+]
+tf = [
+    "keras>=3",
+    "tensorflow",
+]
+# `[keras]` is an alias of `[tf]` (self-referencing extra, needs pip >= 21.2).
+# Tied to [project].name: renaming the project breaks this alias.
+keras = [
+    "yui-ocr[tf]",
+]
+
+dev = [
+    "pytest>=7.0",
+    "pytest-cov",
+    "pytest-xdist",
+    "pytest-timeout",   # per-test deadlock guard (see [tool.pytest.ini_options].timeout)
+]
+
+[tool.setuptools.packages.find]
+include = ["utils*", "loggers*", "models*", "architectures*", "custom_train_objects*"]
+
+[tool.setuptools.dynamic]
+version = { attr = "__version__.__version__" }
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+norecursedirs = [
+    "data", "tmp", "__reproduction", "__pycache__", ".ipynb_checkpoints",
+    "notebooks", "pretrained_models",
+]
+addopts = "-ra --strict-markers"
+filterwarnings = ["ignore"]
+timeout = 60
+markers = [
+    "tensorflow: requires `tensorflow` to be installed (auto-skipped otherwise)",
+    "keras: requires `keras` to be installed, e.g. to build tensors (auto-skipped otherwise)",
+    "torch: requires `torch` to be installed (auto-skipped otherwise)",
+    "cv2: requires `opencv-python` (cv2) to be installed (auto-skipped otherwise)",
+    "gpu: requires a GPU to run",
+    "slow: slow test (heavy models / long compute) — deselect with -m 'not slow'",
+    "reproducibility: compares against a stored golden file",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["utils", "models", "architectures", "loggers", "custom_train_objects"]
+omit = ["tests/*", "*/notebooks/*", "*/pretrained_models/*"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+]

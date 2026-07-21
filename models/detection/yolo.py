@@ -88,11 +88,11 @@ class YOLO(BaseDetector):
     
     @property
     def grid_h(self):
-        return self.output_shape[1]
-    
+        return self.model.output_shape[1]
+
     @property
     def grid_w(self):
-        return self.output_shape[2]
+        return self.model.output_shape[2]
 
     @property
     def nb_box(self):

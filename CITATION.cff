@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+message: "If you use this project in your work, please cite it as below."
+title: "ocr: scene-text detection & recognition (EAST + CRNN) built on the BaseModel interface"
+abstract: >-
+  Optical Character Recognition toolkit combining scene-text detection (EAST) and
+  text recognition (CRNN), built on the `BaseModel` interface with keras-free
+  runtimes — part of the yui-mhcp projects.
+authors:
+  - name: "yui"
+    email: "yui-mhcp@tutanota.com"
+type: software
+version: 1.0.0
+date-released: 2026-07-21
+license: AGPL-3.0-or-later
+url: "https://github.com/yui-mhcp"
+repository-code: "https://github.com/yui-mhcp/ocr"
+keywords:
+  - deep-learning
+  - keras
+  - ocr
+  - text-detection
+  - text-recognition
+  - crnn
+  - east
+  - tensorrt

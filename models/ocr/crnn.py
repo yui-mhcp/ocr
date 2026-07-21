@@ -10,7 +10,7 @@
 # limitations under the License.
 
 from .base_ocr import BaseOCR
-from ..utils import is_model_name
+from ..core.utils import is_model_name
 
 class CRNN(BaseOCR):
     def __init__(self, lang = 'multi', * args, pretrained = None, pretrained_lang = None, ** kwargs):
@@ -56,4 +56,3 @@ class CRNN(BaseOCR):
                 ** kwargs
             }
         super().build(model = model)
-    

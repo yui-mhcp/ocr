@@ -11,16 +11,14 @@
 
 import os
 import logging
-import importlib
 
 from utils import setup_environment
-from ..interfaces import BaseModel
+from utils.generic_utils import import_submodules
+from ..core import BaseModel
+from ..core.utils import get_saving_dir, get_model_class, get_model_config
 
 _models = {}
-for module in os.listdir(__package__.replace('.', os.path.sep)):
-    if module.startswith(('.', '_')) or '_old' in module: continue
-    module = importlib.import_module(__package__ + '.' + module[:-3])
-    
+for module in import_submodules(__package__):
     _models.update({
         k : v for k, v in vars(module).items() if isinstance(v, type) and issubclass(v, BaseModel)
     })
@@ -39,13 +37,14 @@ def get_model(label = None, model = None, ** kwargs):
             model = _pretrained[label]
         else:
             logger.info('No default model for label {}, searching for a model with this label...'.format(label))
-            for name in get_models(model_class = tuple(_detection_models.keys())):
+            for name in os.listdir(get_saving_dir()):
+                if get_model_class(name) not in _models: continue
                 if label in get_model_config(name).get('labels', []):
                     model = name
                     break
     
     if model is None:
-        raise ValueError('No model found for label {}'.format(model, label))
+        raise ValueError('No model found for label {}'.format(label))
     elif isinstance(model, str):
         model = get_pretrained(model, ** kwargs)
     
@@ -57,6 +56,7 @@ def stream(stream, *, label = None, model = None, ** kwargs):
     return get_model(label = label, model = model, ** kwargs).stream(stream, ** kwargs)
 
 def detect(images, *, label = None, model = None, ** kwargs):
+    setup_environment(** kwargs)
     return get_model(label = label, model = model, ** kwargs).predict(images, ** kwargs)
 
 _pretrained = {

@@ -1,43 +1,76 @@
 # :yum: Optical Character Recognition (OCR)
 
+![Python](https://img.shields.io/badge/python-3.12-blue.svg)
+![License](https://img.shields.io/badge/licence-AGPL--3.0-green.svg)
+![Version](https://img.shields.io/badge/version-1.0.0-orange.svg)
+
 Check the [CHANGELOG](https://github.com/yui-mhcp/yui-mhcp/blob/main/CHANGELOG.md) file to have a global overview of the latest modifications! :yum:
 
 ## Project structure
 
 ```bash
 ├── architectures            : utilities for model architectures
-│   ├── layers               : custom layer implementations
-│   ├── transformers         : transformer architecture implementations
-│   ├── common_blocks.py     : defines common blocks (e.g., Conv + BN + ReLU)
-│   ├── crnn_arch.py         : CRNN architecture
-│   ├── east_arch.py         : EAST architecture
-│   ├── generation_utils.py  : utilities for text and sequence generation
-│   ├── hparams.py           : hyperparameter management
-│   ├── simple_models.py     : defines classical models such as CNN / RNN / MLP and siamese
-│   └── yolo_arch.py         : YOLOv2 architecture
+│   ├── layers                   : custom layer implementations
+│   ├── transformers             : transformer architecture implementations
+│   ├── crnn_arch.py             : CRNN architecture (text recognition)
+│   ├── current_blocks.py        : defines common blocks (e.g., Conv + BN + ReLU)
+│   ├── east_arch.py             : EAST architecture (scene-text detection)
+│   ├── generation_utils.py      : utilities for text and sequence generation
+│   ├── hparams.py               : hyperparameter management
+│   ├── simple_models.py         : defines classical models such as CNN / RNN / MLP and siamese
+│   └── yolo_arch.py             : YOLOv2 architecture (generic object detection)
 ├── custom_train_objects     : custom objects used in training / testing
-├── loggers                  : logging utilities for tracking experiment progress
+│   ├── callbacks                : training callbacks (checkpoint / history)
+│   ├── generators               : custom data generators
+│   ├── losses                   : loss functions (incl. `text_loss` for CTC-based OCR)
+│   ├── metrics                  : metrics (incl. `text_accuracy`)
+│   ├── optimizers               : optimizer loading + custom LR schedulers
+│   ├── checkpoint_manager.py    : handle model checkpoint management
+│   └── history.py               : main History class to track training statistics / config
+├── loggers                  : custom utilities for the `logging` module*
 ├── models                   : main directory for model classes
-│   ├── detection            : detector implementations
-│   │   ├── base_detector.py : abstract base class for all detectors
-│   │   ├── east.py          : EAST implementation for text detection
-│   │   └── yolo.py          : YOLOv2 implementation for general object detection
-│   ├── interfaces           : directories for interface classes
-│   ├── ocr                  : OCR implementations
-│   │   ├── base_ocr.py      : abstract base class for all OCR models
-│   │   └── crnn.py          : CRNN implementation for OCR
-│   └── weights_converter.py : utilities to convert weights between different models
-├── tests                    : unit and integration tests for model validation
-├── utils                    : utility functions for data processing and visualization
-├── LICENCE                  : project license file
+│   ├── core                     : the `BaseModel` foundation
+│   │   ├── mixins                   : composable features mixed into `BaseModel`
+│   │   │   ├── audio_mixin.py           : audio processing functions
+│   │   │   ├── checkpoint_mixin.py      : checkpoint / weights management
+│   │   │   ├── classification_mixin.py  : classification utilities
+│   │   │   ├── image_mixin.py           : image processing functions
+│   │   │   ├── processing_mixin.py      : generic input / output processing
+│   │   │   ├── text_mixin.py            : text encoding / decoding / processing
+│   │   │   └── training_mixin.py        : training loop / `fit` utilities
+│   │   ├── utils                    : internal helpers for the model core
+│   │   │   ├── describe.py              : model description / summary helpers
+│   │   │   ├── migration.py             : legacy config / weights migration
+│   │   │   └── saving.py                : model saving / loading helpers
+│   │   └── base_model.py            : main `BaseModel` class assembling the mixins
+│   ├── detection                : detector implementations
+│   │   ├── base_detector.py         : abstract base class for all detectors
+│   │   ├── east.py                  : EAST implementation for text detection
+│   │   └── yolo.py                  : YOLOv2 implementation for general object detection
+│   ├── ocr                      : OCR implementations
+│   │   ├── base_ocr.py              : abstract base class for all OCR models
+│   │   ├── box_filters.py           : filtering / post-processing of detected text boxes
+│   │   ├── crnn.py                  : CRNN implementation for text recognition
+│   │   └── streaming.py             : OCR over a stream of images
+│   └── weights_converter.py     : utilities to convert weights between different models
+├── pretrained_models        : pretrained checkpoints (`crnn_en`, `east`, `yolo_coco`)
+├── tests                    : `pytest` suite mirroring the `utils` / `loggers` / model tree*
+├── utils                    : shared data-processing / keras utilities*
 ├── ocr.ipynb                : notebook demonstrating model creation + OCR features
-├── README.md                : this file
-└── requirements.txt         : required packages
+├── text.jpg                 : example image used by the notebook
+├── CHANGELOG.md             : project-specific changelog
+├── CONTRIBUTING.md          : contribution guidelines
+├── INSTALLATION.md          : shared GPU environment installation guide
+├── LICENCE                  : project license file
+├── pyproject.toml           : project metadata, dependencies and tooling config
+└── README.md                : this file
 ```
 
-Check [the main project](https://github.com/yui-mhcp/base_dl_project) for more information about the unextended modules / structure / main classes. 
+\* The `loggers`, `utils` and most of the `tests` tree are the shared foundation maintained in [the data_processing repository](https://github.com/yui-mhcp/data_processing) — check it for more information on these modules.
 
-Check [the detection project](https://github.com/yui-mhcp/detection) for more information about the `detection` module and the [EAST](https://arxiv.org/abs/1704.03155) Scene-Text Detection model. 
+Check [the base project](https://github.com/yui-mhcp/base_dl_project) for more information about the `BaseModel` interface, the `architectures` / `custom_train_objects` modules and the general project structure.
+
+Check [the detection project](https://github.com/yui-mhcp/detection) for more information about the `detection` module and the [EAST](https://arxiv.org/abs/1704.03155) Scene-Text Detection model.
 
 ## Available features
 
@@ -45,7 +78,8 @@ Check [the detection project](https://github.com/yui-mhcp/detection) for more in
 
 | Feature   | Function / class   | Description |
 | :-------- | :---------------- | :---------- |
-| OCR       | `ocr`  | Performs OCR on the given image(s)   |
+| OCR       | `ocr`    | Performs OCR on the given image(s) (detection + recognition) |
+| Streaming | `stream` | Runs OCR on a stream of images   |
 
 You can check the `ocr` notebook for a concrete demonstration.
 
@@ -53,7 +87,7 @@ You can check the `ocr` notebook for a concrete demonstration.
 
 ### Model architectures
 
-Available architectures : 
+Available architectures :
 - `detection` :
     - [EAST](https://arxiv.org/abs/1704.03155)
 - `OCR` :
@@ -72,13 +106,74 @@ The pretrained version of EAST can be downloaded [from this project](https://git
 
 ## Installation and usage
 
-See [the installation guide](https://github.com/yui-mhcp/blob/master/INSTALLATION.md) for a step-by-step installation :smile:
+See [the installation guide](INSTALLATION.md) for a step-by-step setup of the shared GPU environment (NVIDIA driver, CUDA, `mamba` and the deep-learning backends) :smile:
 
-Here is a summary of the installation procedure, if you have a working python environment :
-1. Clone this repository: `git clone https://github.com/yui-mhcp/ocr.git`
-2. Go to the root of this repository: `cd ocr`
-3. Install requirements: `pip install -r requirements.txt`
-4. Open the `ocr` notebook and follow the instructions!
+Here is a summary of the installation procedure, once your python environment is ready :
+1. Clone this repository : `git clone https://github.com/yui-mhcp/ocr.git`
+2. Go to the root of this repository : `cd ocr`
+3. Install the package with a backend : `pip install -e .[tf]` (or `pip install -e .[torch]`)
+4. Open the `ocr` notebook and follow the instructions !
+
+Like `base_dl_project`, this project runs real models, so it needs a **keras backend**. The **image** stack (detection / OCR I/O) and the **text** stack (cleaning / tokenization for the recognition head) are core and already bundled in the base install — you only pick the backend matching your setup :
+
+```bash
+pip install -e .[tf]         # keras + tensorflow
+pip install -e .[torch]      # keras + torch
+pip install -e .[keras]      # alias of [tf]
+
+# optional helpers :
+pip install -e .[datasets]   # utils/datasets (tensorflow-datasets, pandas)
+pip install -e .[dev]        # test tooling (pytest & plugins)
+```
+
+The backend is selected at runtime through the `KERAS_BACKEND` environment variable (e.g., `os.environ['KERAS_BACKEND'] = 'tensorflow'`), as shown at the top of the example notebook.
+
+**Note on pretrained weights** : the pretrained `CRNN` (EasyOCR) and `EAST` (SakuraRiven) checkpoints are stored as `torch` weights and converted to `keras` on the fly, so `torch` is required for the conversion **even if you use the tensorflow backend** (`pip install torch`).
+
+### Quickstart
+
+```python
+import os
+os.environ['KERAS_BACKEND'] = 'tensorflow'
+
+from models.ocr import ocr
+
+# Detect the text boxes (EAST) then recognize them (CRNN), on a single image.
+# The pretrained `crnn_en` / `east` weights are downloaded + converted automatically.
+infos = ocr(
+    'text.jpg', model = 'crnn_en', detector = 'east', display = True
+)[0]
+print(infos)
+```
+
+You can also build the models explicitly from the `BaseModel` interface :
+
+```python
+from models.detection import EAST
+from models.ocr import CRNN
+
+detector = EAST(nom = 'east', labels = 'text', input_size = (None, None, 3))
+model    = CRNN(nom = 'crnn_en', lang = 'english', pretrained_lang = 'english')
+print(model)
+```
+
+See the `ocr.ipynb` notebook for the full walkthrough (model creation, detection, recognition, line/paragraph combination and streaming). :smile:
+
+### Testing
+
+The tests use [`pytest`](https://docs.pytest.org/) and live in the `tests/` directory, mirroring the `utils` / `loggers` and model tree.
+
+```bash
+pip install -e .[dev]        # pytest, pytest-cov, pytest-xdist, pytest-timeout
+
+pytest                       # run the whole suite
+pytest -n auto               # run in parallel (pytest-xdist)
+pytest -m "not slow"         # skip the slow / heavy tests
+pytest --cov                 # run with coverage report
+pytest tests/models          # run a single subpackage
+```
+
+Tests are annotated with markers (declared in `pyproject.toml`) so the suite adapts to your environment : the `tensorflow`, `torch`, `keras`, `cv2` and `gpu` markers are **auto-skipped** when the corresponding dependency (or hardware) is missing, meaning you can run the tests for the backend you installed without pulling every dependency.
 
 ## TO-DO list:
 
@@ -133,7 +228,7 @@ Contacts:
 - **Mail**: `yui-mhcp@tutanota.com`
 - **[Discord](https://discord.com)**: yui0732
 
-This project is licensed under the GNU Affero General Public License v3.0 (AGPL-3.0). See the [LICENSE](LICENSE) file for details.
+This project is licensed under the GNU Affero General Public License v3.0 (AGPL-3.0). See the [LICENCE](LICENCE) file for details.
 
 This license allows you to use, modify, and distribute the code, as long as you include the original copyright and license notice in any copy of the software/source. Additionally, if you modify the code and distribute it, or run it on a server as a service, you must make your modified version available under the same license.
 
@@ -144,7 +239,7 @@ For more information about the AGPL-3.0 license, please visit [the official webs
 If you find this project useful in your work, please add this citation to give it more visibility! :yum:
 
 ```
-@misc{yui-mhcp
+@misc{yui-mhcp,
     author  = {yui},
     title   = {A Deep Learning projects centralization},
     year    = {2021},

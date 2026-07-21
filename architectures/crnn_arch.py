@@ -811,4 +811,3 @@ def _load_easyocr_crnn(model = None, lang = 'english', gen = 2):
         os.remove(zip_file)
     
     return torch.load(model_path, map_location = 'cpu'), infos
-    

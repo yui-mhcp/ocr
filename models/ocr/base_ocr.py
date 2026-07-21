@@ -16,49 +16,30 @@ import logging
 import numpy as np
 
 from functools import partial
-from dataclasses import dataclass, field
 
 from loggers import Timer, timer
-from utils.text import edit_distance
 from utils.keras import TensorSpec, ops
-from utils import contains_index_format, dice_coeff, format_path_index, load_json, pad_batch, plot, plot_multiple
-from utils.image import HTTPScreenMirror, SizeFilter, RegionFilter, RepetitionFilter, _image_formats, combine_boxes, compute_ioa, convert_box_format, draw_boxes, filter_boxes, show_boxes
+from utils import contains_index_format, format_path_index, load_json, pad_batch, plot_multiple
+from utils.image import HTTPScreenMirror, combine_boxes
 from utils.callbacks import ImageSaver, JSONSaver, FunctionCallback, OCRDisplayer, QueueCallback, apply_callbacks
-from ..interfaces.base_text_model import BaseTextModel
-from ..interfaces.base_image_model import BaseImageModel
+from ..core import BaseModel, TextModelMixin, ImageModelMixin
+from .box_filters import filter_boxes
+from .streaming import (
+    StreamState, build_stream_filters, display_stream_results, emit_stream_results,
+    filter_text_results
+)
 
 logger  = logging.getLogger(__name__)
 
-@dataclass
-class StreamState:
-    is_file : bool  = False
-    
-    emitted_texts   : set   = field(default_factory = set, repr = False)
-    last_texts  : list  = field(default_factory = list)
-    last_boxes  : np.ndarray    = field(default = None, repr = False)
-    
-    n_skipped   : int   = 0
-    n_duplicates    : int   = 0
-    prev_output : np.ndarray    = field(default = None, repr = False)
-    
-    repetition_filter   : RepetitionFilter   = None
-    
-    def set_new_frame(self, output):
-        self.prev_output    = output
-        self.last_texts = []
-        self.last_boxes = None
-        self.n_duplicates   = 0
-        #if self.repetition_filter is not None: self.repetition_filter.clear()
-    
-class BaseOCR(BaseImageModel, BaseTextModel):
+class BaseOCR(ImageModelMixin, TextModelMixin, BaseModel):
     _directories    = {
-        ** BaseImageModel._directories, 'stream_dir' : '{root}/{self.name}/stream'
+        ** BaseModel._directories, 'stream_dir' : '{root}/{self.name}/stream'
     }
 
-    output_signature    = BaseTextModel.text_signature
+    output_signature    = TextModelMixin.text_signature
 
-    prepare_input   = BaseImageModel.get_image_with_box
-    prepare_output  = BaseTextModel.encode_text
+    prepare_input   = ImageModelMixin.get_image_with_box
+    prepare_output  = TextModelMixin.encode_text
     
     def __init__(self, lang = 'multi', input_size = None, max_output_length = None, ** kwargs):
         self._init_text(lang = lang, ** kwargs)
@@ -70,7 +51,7 @@ class BaseOCR(BaseImageModel, BaseTextModel):
         
         if self.runtime == 'keras':
             from architectures import set_cudnn_lstm
-            set_cudnn_lstm(self.model)
+            set_cudnn_lstm(self.model.engine)
         
         if hasattr(self.model, 'set_tokens'): self.model.set_tokens(** self.model_tokens)
 
@@ -137,11 +118,11 @@ class BaseOCR(BaseImageModel, BaseTextModel):
                               - output  : `Tensor`, the model output
             
             Note : depending whether `image` is a filename already in `predicted`, some keys in the output may be missing (notably `output` and `image`)
-                
         """
         if predicted and not overwrite and isinstance(data, str) and data in predicted:
-            if callbacks: apply_callbacks(callbacks, predicted[data], {}, save = False)
-            return predicted[data]
+            return self._finalize_cached_prediction(
+                data, callbacks = callbacks, predicted = predicted
+            )
         
         filename, image = self.get_image_data(data)
         if not isinstance(data, dict) or 'boxes' not in data:
@@ -221,7 +202,7 @@ class BaseOCR(BaseImageModel, BaseTextModel):
                         if isinstance(texts[0], list): texts = [txt[0] for txt in texts]
                         scores = ops.convert_to_numpy(scores).reshape(-1)
 
-            if threshold < 0. and np.any(scores < threshold):
+            if threshold != 0. and np.any(scores <= threshold):
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug('- Prediction score is too low, skipping this prediction')
                 continue
@@ -245,14 +226,12 @@ class BaseOCR(BaseImageModel, BaseTextModel):
             'ocr'       : ocr_results,
             'image'     : image
         }
-        
-        entry = None
-        if callbacks:
-            infos = {k : v for k, v in output.items() if 'image' not in k}
+        return self._finalize_predictions(
+            output, callbacks = callbacks, predicted = predicted, return_output = return_output
+        )
 
-            entry = apply_callbacks(callbacks, infos, output, save = True)
-        
-        return output if return_output else predicted.get(entry, {})
+    def filter_prediction_output(self, output):
+        return {k : v for k, v in output.items() if 'image' not in k}
 
     
     def compile(self, *, loss = None, metrics = None, ** kwargs):
@@ -367,12 +346,9 @@ class BaseOCR(BaseImageModel, BaseTextModel):
 
         return predicted, callbacks
 
-    @timer
-    def predict(self, inputs, ** kwargs):
-        if (isinstance(inputs, (str, dict))) or (ops.is_array(inputs) and len(inputs.shape) == 3):
-            inputs = [inputs]
-        
-        return super().predict(inputs, ** kwargs)
+    def _normalize_prediction_inputs(self, inputs):
+        if ops.is_array(inputs) and len(inputs.shape) == 3: return [inputs]
+        return super()._normalize_prediction_inputs(inputs)
 
     def stream_fn(self,
                   *,
@@ -380,8 +356,10 @@ class BaseOCR(BaseImageModel, BaseTextModel):
                   boxes,
                   output,
                   frame_index,
-                  detected  = None,
+                  state,
                   
+                  detected  = None,
+
                   display   = True,
                   verbose   = True,
                   filters   = None,
@@ -391,129 +369,114 @@ class BaseOCR(BaseImageModel, BaseTextModel):
                   duplicate_threshold  = 0.9,
                   duplicate_tolerance  = 5,
                   duplicate_wait_time  = 0.,
+                  rescan_every = None,
 
-                  threshold    = -0.2,
+                  k    = 5,
+                  max_dist     = 0.2,
+                  text_threshold   = -0.2,
+                  skip_non_alpha   = True,
+                  skip_single_word = True,
+
                   wait_factor  = 0.,
-                  
+
                   ** kwargs
                  ):
+        """
+            Per-frame streaming callback (cf `stream`) : de-duplicates the frame against the
+            previous detection map, OCR-ises the (box-filtered) new regions, filters the texts,
+            then emits the genuinely new results (`state`, logs, `callback` and `callbacks`).
+
+            `kwargs` are forwarded to `self.infer` (generation / box-combination config).
+        """
         if verbose: logger.info('Frame #{} ({} boxes)'.format(frame_index, len(boxes['boxes'])))
 
         output = output[:, :, 0]
         if len(boxes['boxes']) == 0:
-            self._stream_state.set_new_frame(output)
-            self._stream_state.n_skipped += 1
+            state.set_new_frame(output)
+            state.n_skipped += 1
             return
 
-        is_duplicate, dice = False, 0.
-        if self._stream_state.prev_output is not None:
-            dice = dice_coeff(output, self._stream_state.prev_output)
-            is_duplicate = dice >= duplicate_threshold
+        if rescan_every is None: rescan_every = duplicate_tolerance
+        prev_output = state.prev_output
+        skip, is_duplicate, dice = state.should_skip_duplicate(
+            output,
+            duplicate_threshold = duplicate_threshold,
+            duplicate_tolerance = duplicate_tolerance,
+            rescan_every    = rescan_every
+        )
 
-        if verbose:
-            logger.info('- Is duplicte : {} ({:.3f}) - waiting : {}'.format(
-                is_duplicate, dice, len(self._stream_state.repetition_filter) if self._stream_state.repetition_filter is not None else '?'
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug('- Is duplicate : {} ({:.3f}) - waiting : {}'.format(
+                is_duplicate, dice, len(state.repetition_filter) if state.repetition_filter is not None else '?'
             ))
 
-        if is_duplicate:
-            self._stream_state.n_duplicates += 1
-            if self._stream_state.n_duplicates > duplicate_tolerance:
-                if not self._stream_state.is_file and self._stream_state.n_duplicates % 2 == 0:
-                    time.sleep(duplicate_wait_time)
+        if not is_duplicate and display == 3 and prev_output is not None:
+            plot_multiple(
+                image = image, output = output, prev = prev_output, plot_type = 'imshow', ncols = 3
+            )
 
-                if self._stream_state.n_skipped % duplicate_tolerance < 2:
-                    self._stream_state.n_skipped += 1
-                    return
-
-        else:
-            if display == 3 and self._stream_state.prev_output is not None:
-                plot_multiple(
-                    image = image, output = output, prev = self._stream_state.prev_output,
-                    plot_type = 'imshow', ncols = 3
-                )
-            self._stream_state.set_new_frame(output)
+        if skip:
+            state.n_skipped += 1
+            # throttles the frame consumption on a live stream showing a static scene
+            if duplicate_wait_time and not state.is_file:
+                time.sleep(duplicate_wait_time)
+            return
 
         res = self.infer(
             {'image' : image, 'boxes' : boxes}, combine = True, box_filters = filters, ** kwargs
         ).get('ocr', [])
 
-        is_empty    = len(res) == 0
-        if not is_empty:
-            emitted_boxes = np.array([ocr_res['boxes'] for ocr_res in res])
-            if self._stream_state.last_boxes is None:
-                if verbose: logger.info('- 1st emission : {}'.format(self._stream_state))
-                self._stream_state.last_boxes = emitted_boxes
-            else:
-                self._stream_state.last_boxes = np.concatenate([
-                    self._stream_state.last_boxes, emitted_boxes
-                ], axis = 0)
-            
-            res = [ocr_res for ocr_res in res if _filter_text_results(
-                ocr_res,
-                self._stream_state.emitted_texts,
-                self._stream_state.last_texts,
-                threshold = threshold,
-                verbose = verbose,
-                ** kwargs
-            )]
+        if len(res) == 0:
+            state.n_skipped += 1
+            return
+        
+        # NOTE : `last_boxes` accumulates *all* OCR-ised boxes, on purpose *before* the text
+        # filtering below : a region whose text is rejected (e.g. a recurring false positive)
+        # is still memorized so `make_emitted_box_filter` stops re-OCR-ising it every frame.
+        emitted_boxes = np.array([ocr_res['boxes'] for ocr_res in res])
+        if state.last_boxes is None:
+            if verbose: logger.info('- 1st emission : {}'.format(state))
+            state.last_boxes = emitted_boxes
+        else:
+            state.last_boxes = np.concatenate([state.last_boxes, emitted_boxes], axis = 0)
+
+        res = [ocr_res for ocr_res in res if filter_text_results(
+            ocr_res,
+            state.emitted_texts,
+            state.last_texts,
+            text_threshold  = text_threshold,
+            k   = k,
+            max_dist    = max_dist,
+            skip_non_alpha  = skip_non_alpha,
+            skip_single_word    = skip_single_word,
+            verbose = verbose
+        )]
 
         if len(res) == 0:
-            self._stream_state.n_skipped += 1
-
-            if not is_empty and verbose:
-                logger.info('[SKIP] All results have been filtered !'.format(frame_index))
-
-            return
-        else:
-            self._stream_state.n_skipped = 0
-
-        if display:
-            emitted_boxes = np.array([ocr_res['boxes'] for ocr_res in res])
-            if detected is None:
-                detected = draw_boxes(
-                    ops.convert_to_numpy(image, copy = True),
-                    emitted_boxes,
-                    source  = 'xyxy',
-                    color   = 'r',
-                    labels  = ['text'],
-                    show_text   = False
-                )
-            plot(detected, plot_type = 'imshow')
-
-        for ocr_result in res:
-            self._stream_state.last_texts.append(ocr_result['text'])
-            self._stream_state.emitted_texts.add(ocr_result['text'])
-
             if verbose:
-                logger.info('Box  : {}\nScores : {}\nText   : {}'.format(
-                    np.around(convert_box_format(
-                        ocr_result['boxes'], target = 'xywh', source = ocr_result['format']
-                    ), decimals = 3),
-                    np.around(ocr_result['scores'], decimals = 3),
-                    ocr_result['text']
-                ))
+                logger.info('[SKIP] Frame #{} : all results have been filtered !'.format(frame_index))
 
-            if callback: callback(ocr_result['text'])
+            state.n_skipped += 1
+            return
 
-            if display > 1:
-                show_boxes(image, ocr_result['boxes'], source = ocr_result['format'])
-                if len(ocr_result['rows']) > 1:
-                    show_boxes(
-                        image,
-                        ocr_result['rows'],
-                        source = ocr_result['format'],
-                        ncols    = len(ocr_result['rows'])
-                    )
+        state.n_skipped = 0
+        
+        if display:
+            display_stream_results(image, res, detected = detected, display = display)
+
+        emit_stream_results(state, res, callback = callback, verbose = verbose)
 
         if callbacks:
-            apply_callbacks(callbacks, {}, {
-                'image' : image, 'frame_index' : frame_index, 'boxes' : boxes, 'ocr' : res
-            })
+            # the emitted (filtered) results are applied manually here, and *not* inside
+            # `self.infer` : callbacks must only run on genuinely new text (see the
+            # duplicate / repetition filtering above)
+            out = {'image' : image, 'frame_index' : frame_index, 'boxes' : boxes, 'ocr' : res}
+            apply_callbacks(callbacks, self.filter_prediction_output(out), out)
 
         if wait_factor:
-            time.sleep(
-                1. + wait_factor * max([len(ocr_res['text']) for ocr_res in res])
-            )
+            # leaves time to the TTS to read the emitted text before the next prediction
+            # (hypothesis : the text stays on screen at least the time to read it)
+            time.sleep(1. + wait_factor * max([len(ocr_res['text']) for ocr_res in res]))
 
     def stream(self,
                stream,
@@ -549,25 +512,22 @@ class BaseOCR(BaseImageModel, BaseTextModel):
                buffer_size  = 1,
                
                output_shape = None,
-               
+
                ** kwargs
               ):
-        ####################
-        #    OCR method    #
-        ####################
-        
-        self._stream_state = StreamState(is_file = isinstance(stream, str) and os.path.isfile(stream))
-        
-        def _filter_emitted_boxes(boxes, ** _):
-            if self._stream_state.last_boxes is None: return list(range(len(boxes)))
-            ioa = compute_ioa(boxes, self._stream_state.last_boxes, as_matrix = True, source = 'xyxy')
-            return np.where(np.all(ioa < ioa_threshold, axis = 1))[0]
+        """
+            Runs the OCR streaming pipeline : `detector.stream(...)` is called with
+            `post_processing = self.stream_fn`, which is applied on each frame (with the frame
+            and its detected boxes).
 
+            kwargs routing :
+                - `kwargs` are forwarded to `stream_fn` **only** (i.e. to `self.infer` :
+                  generation / box-combination / text-filtering config)
+                - `detector_kwargs` are forwarded to `detector.stream(...)` **only** (detector
+                  inference + `stream_camera` config, e.g. `use_xla`, `nb_frames`, ...)
+        """
+        state = StreamState(is_file = isinstance(stream, str) and os.path.isfile(stream))
 
-        ####################
-        #  Initialization  #
-        ####################
-        
         if isinstance(detector, str):
             from models import get_pretrained
             detector = get_pretrained(detector)
@@ -577,7 +537,7 @@ class BaseOCR(BaseImageModel, BaseTextModel):
             assert hasattr(callback, 'put'), '`callback` must be callable or have a put method !'
             callback = callback.put
         
-        _is_file_stream = self._stream_state.is_file
+        _is_file_stream = state.is_file
         
         if save_stream is None: save_stream = save and not _is_file_stream
         if save_frames is None: save_frames = save
@@ -601,38 +561,17 @@ class BaseOCR(BaseImageModel, BaseTextModel):
             save_in_parallel  = save_in_parallel
         )
         
-        # Initializes filters
-        if filters is None:
-            filters = [SizeFilter(min_h = 0.025, min_w = 0.1)]
-            if region:
-                filters.append(RegionFilter(region = region, source = 'xyxy', mode = 'center'))
-            if n_repeat:
-                filters.append(RepetitionFilter(n_repeat = n_repeat, use_memory = False))
-        elif not isinstance(filters, list):
-            filters = [filters]
-        
-        if ioa_threshold:
-            filters.append(_filter_emitted_boxes)
-        
-        repet_filter = None
-        if any(isinstance(f, RepetitionFilter) for f in filters):
-            self._stream_state.repetition_filter = [
-                f for f in filters if isinstance(f, RepetitionFilter)
-            ][0]
-        
+        # Initializes the box-filter chain (also registers the `RepetitionFilter` on the state)
+        filters = build_stream_filters(
+            filters, state, region = region, n_repeat = n_repeat, ioa_threshold = ioa_threshold
+        )
+
         logits_filter = ops.convert_to_tensor([self.ukn_token_idx], 'int32')
         
         camera = stream
         if not _is_file_stream and isinstance(stream, str) and stream.startswith('http://192'):
-            for _ in range(5):
-                camera = HTTPScreenMirror(stream)
-                ret, frame  = camera.read()
-                if not ret:
-                    time.sleep(1)
-                else:
-                    output_shape    = frame.shape[:2]
-                    break
-            if not ret: raise RuntimeError('Unable to connect to {} !'.format(stream))
+            camera, frame = HTTPScreenMirror.build(stream)
+            output_shape  = frame.shape[:2]
 
         try:
             return detector.stream(
@@ -647,15 +586,17 @@ class BaseOCR(BaseImageModel, BaseTextModel):
                 directory   = directory,
                 stream_name = stream_name,
                 save_stream = save_stream,
+                save_transformed    = save_transformed,
 
                 output_shape = output_shape,
 
                 return_output   = True,
                 post_processing = partial(
                     self.stream_fn,
+                    state   = state,
                     verbose = verbose,
                     display = display,
-                    
+
                     filters = filters,
                     callback    = callback,
                     callbacks   = callbacks,
@@ -663,7 +604,7 @@ class BaseOCR(BaseImageModel, BaseTextModel):
                     ** kwargs
                 ),
 
-                ** {** kwargs, ** detector_kwargs}
+                ** detector_kwargs
             )
         finally:
             for callback in callbacks: callback.join()
@@ -675,51 +616,3 @@ class BaseOCR(BaseImageModel, BaseTextModel):
             ** self.get_config_text(),
             'max_output_length' : self.max_output_length
         }
-
-def _filter_text_results(ocr_result,
-                         reject,
-                         last_emitted   = [],
-                         threshold      = 0.,
-                         verbose    = True,
-                         *,
-                         
-                         k   = 5,
-                         max_dist   = 0.2,
-                         skip_non_alpha = True,
-                         skip_single_word   = True,
-                         
-                         ** kwargs
-                        ):
-    ocr_result['text'] = ocr_result['text'].replace('</s>', '').strip()
-    text = ocr_result['text']
-    if not text: return False
-    elif skip_single_word and ' ' not in text: return False
-    elif skip_non_alpha and not any(c.isalpha() for c in text): return False
-    elif text in reject:
-        if verbose: logger.info('Detected text was already emitted')
-        return False
-    
-    if threshold != 0. and np.any(ocr_result['scores'] <= threshold):
-        parts = text.split(' \n')
-        if verbose:
-            logger.info('Some scores are too low !\n{}'.format('\n'.join([
-                '- {:.3f} : {}'.format(s, t) for s, t in zip(ocr_result['scores'], parts)
-            ])))
-        if np.all(ocr_result['scores'] <= threshold): return False
-
-        if verbose: logger.info('Parts : {}'.format(parts))
-        text = ' \n'.join([
-            p if s > threshold else '' for p, s in zip(parts, ocr_result['scores'])
-        ]).strip()
-        ocr_result['text'] = text
-    
-    if last_emitted and k:
-        for emitted in last_emitted[- k :]:
-            dist = edit_distance(emitted, text, normalize = True)
-            if dist < max_dist:
-                if verbose:
-                    logger.info('Rejecting text due to an edit distance of {:.3f}\n  Text : {}\n  Previously emitted : {}'.format(dist, text, emitted))
-                reject.add(text)
-                return False
-
-    return True
