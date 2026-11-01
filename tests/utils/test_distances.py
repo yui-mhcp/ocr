@@ -36,7 +36,7 @@ from contextlib import nullcontext
 
 from sklearn.utils import shuffle as sklearn_shuffle
 
-from utils.distances import distance, knn, euclidian_distance
+from utils.distances import distance, knn, euclidian_distance, dice_coeff
 
 MAX_ERR = 1e-5
 
@@ -189,6 +189,21 @@ def test_dice_coeff_matrix_not_implemented(vectors):
     q_np, p_np = vectors
     with pytest.raises(NotImplementedError):
         distance(q_np, p_np, method = 'dice_coeff', as_matrix = True)
+
+def test_dice_coeff_direct(asserts):
+    """ `dice_coeff` called directly (not through the `distance` dispatcher).
+
+        Also pins the zero-union case : `divide_no_nan` returns `0.` (not NaN) — the
+        semantic `RegionTracker._local_dice` deliberately overrides with its empty guard.
+    """
+    a = np.array([1., 1., 0., 0.], dtype = 'float32')
+    b = np.array([1., 1., 1., 1.], dtype = 'float32')
+    # inter = 2, union = 2 + 4 = 6 → 2 * 2 / 6
+    asserts.assert_equal(2. * 2. / 6., dice_coeff(a, b), max_err = MAX_ERR)
+    asserts.assert_equal(1., dice_coeff(b, b), max_err = MAX_ERR)          # identical
+    asserts.assert_equal(0., dice_coeff(a, 1. - a), max_err = MAX_ERR)     # disjoint
+    zero = np.zeros((4, ), dtype = 'float32')
+    asserts.assert_equal(0., dice_coeff(zero, zero), max_err = MAX_ERR)    # empty → divide_no_nan
 
 
 # --- `distance` : dtype coherence (numpy, keras-free) ------------------------------

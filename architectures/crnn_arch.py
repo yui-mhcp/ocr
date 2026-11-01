@@ -16,11 +16,12 @@ import numpy as np
 import keras.ops as K
 
 from keras import layers
+from keras.src.backend.common.masking import get_keras_mask
 from functools import cached_property, partial, wraps
 
 from utils.keras import TensorSpec, replace_kwargs
 from .generation_utils import infer
-from .current_blocks import Conv2DBN, set_cudnn_lstm
+from .current_blocks import Conv2DBN, backend_rnn, enable_rnn_masking, set_cudnn_lstm
 from .layers import get_activation, CustomRNNDropoutCell, CustomEmbedding
 
 _supports_cudnn_lstm    = False
@@ -321,7 +322,8 @@ def BiLSTMSequenceModeling(input_shape  = (None, 256),
             name = '{}-{}'.format(name, i)
         )
         set_cudnn_lstm(bidirectional)
-        
+        enable_rnn_masking(bidirectional)
+
         x = bidirectional(x)
         x = layers.Dense(units, name = '{}-{}-linear'.format(name, i))(x)
 
@@ -621,7 +623,7 @@ class CRNNWithAttn(keras.Model):
         
         encoded = self.encoder(enc_inputs, training = training)
         
-        encoded_mask = getattr(encoded, '_keras_mask', None)
+        encoded_mask = get_keras_mask(encoded)
         encoded_proj = self.attn_cell.process_memory(encoded, training = training)
         
         def step(inputs, state):
@@ -643,7 +645,7 @@ class CRNNWithAttn(keras.Model):
         
         self.attn_cell.init_dropout_mask(embeddings, state, training = training)
         
-        _, dec_output, _ = keras.src.backend.rnn(
+        _, dec_output, _ = backend_rnn(
             step,
             inputs  = embeddings,
             initial_states  = state,

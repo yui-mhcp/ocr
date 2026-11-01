@@ -25,7 +25,29 @@ def __getattr__(name):
     return globals()[name]
 
 def _np_top_k(x, k, sorted = True):
-    indices = np.argsort(x, axis = -1)[..., ::-1][..., :k]
+    """
+        Partial selection (`np.partition`, linear) then a sort of the selected candidates only,
+        rather than a full `argsort` of `x` : the vector-index search ranks a few items among
+        tens of thousands. Ties are broken by the lowest index (like `keras.ops.top_k`) : the
+        candidates are all the values `>=` the k-th largest one, ties included
+    """
+    x = np.asarray(x)
+    n = x.shape[-1]
+    k = max(0, min(int(k), n))
+
+    rows    = x.reshape(-1, n)
+    indices = np.empty((rows.shape[0], k), dtype = 'int64')
+    for i, row in enumerate(rows):
+        if k == 0: continue
+        if k < n:
+            candidates = np.flatnonzero(row >= np.partition(row, n - k)[n - k])
+        else:
+            candidates = np.arange(n)
+        # descending values, then ascending indices
+        order = np.lexsort((candidates, - row[candidates].astype('float64')))[:k]
+        indices[i] = candidates[order]
+
+    indices = indices.reshape(x.shape[:-1] + (k, ))
     return np.take_along_axis(x, indices, axis = -1), indices
 
 top_k = Ops('top_k', numpy_fn = _np_top_k)

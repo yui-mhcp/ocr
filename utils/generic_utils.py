@@ -46,8 +46,13 @@ def time_to_string(seconds):
         '{:.3f} sec'.format(s) if m + h == 0 else '{}sec'.format(int(s))
     )
 
-def timestamp_to_str(timestamp, include_time = True):
-    return datetime.datetime.fromtimestamp(timestamp).strftime(
+def timestamp_to_str(timestamp, include_time = True, tz = None):
+    """ The calendar date of `timestamp`, read in the time zone `tz` (an IANA name / `tzinfo`,
+        `None` = the machine's local time) """
+    if isinstance(tz, str):
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(tz)
+    return datetime.datetime.fromtimestamp(timestamp, tz).strftime(
         "%d-%m-%Y %H:%M" if include_time else '%d %B %Y'
     )
 
@@ -296,6 +301,47 @@ def import_submodules(package, *, filter_fn = None):
         elif filter_fn is not None and not filter_fn(module): continue
         modules.append(importlib.import_module(package + '.' + module.removesuffix('.py')))
     return modules
+
+def resolve_hf_snapshot(name, *, validate = None, ** kwargs):
+    """
+        Resolves a model name (HF repo id) to its **local** cached snapshot, without any network
+        request, so that the loaders (`transformers`, `tensorrt_llm`, ...) read the files from disk
+        instead of checking each of them against the hub (one `HEAD` per file, plus `model_info` /
+        `list_repo_files` calls that `local_files_only` alone does not prevent)
+
+        Arguments :
+            - name      : the repo id (or a local directory / any non-`str` path, returned unchanged)
+            - validate  : `callable (snapshot_dir) -> list` of what the snapshot lacks for the caller,
+                          a non-empty list making the snapshot a miss (e.g. an incomplete download)
+            - kwargs    : forwarded to `snapshot_download` (e.g. `revision`, `cache_dir`)
+        Return :
+            - path  : the snapshot directory, or `name` unchanged (not cached / incomplete), for the
+                      caller to download it
+
+        The resolution is delegated to `huggingface_hub` : it honors the whole cache configuration
+        (`HF_HOME`, `HF_HUB_CACHE`, ...) and the revision the cache refs point at.
+    """
+    if not isinstance(name, str) or os.path.isdir(name): return name
+
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError:
+        return name
+
+    try:
+        resolved = snapshot_download(name, local_files_only = True, ** kwargs)
+    except Exception:
+        logger.info('`{}` is not fully cached, it will be downloaded'.format(name))
+        return name
+
+    missing = validate(resolved) if validate is not None else []
+    if missing:
+        logger.warning('The cached snapshot of `{}` is incomplete ({} is/are missing) : it will '
+                       'be downloaded again\n  Snapshot : {}'.format(name, ', '.join(missing), resolved))
+        return name
+
+    logger.debug('Using cached HF checkpoint for `{}` : {}'.format(name, resolved))
+    return resolved
 
 """ These functions manipulates `pd.DataFrame` """
 

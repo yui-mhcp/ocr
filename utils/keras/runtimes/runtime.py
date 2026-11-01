@@ -34,9 +34,22 @@ class Runtime(metaclass = ABCMeta):
     #     to the given token ids
     #   - `supports_stop_condition`     : the `stop_condition` kwarg (callable / regex on the
     #     decoded text) stops the generation once matched
+    #   - `supports_stop_words` : the `stop_words` kwarg (list of strings) stops the generation
+    #     in the engine itself. Strictly narrower than `stop_condition`, but free : no host-side
+    #     decoding, no aborted request
+    #   - `supports_multimodal_data`    : the `multi_modal_data` kwarg (`{'image' : [raw items]}`)
+    #     is consumed by the runtime itself, which expands the placeholder tokens and runs the
+    #     vision tower : the model only provides the raw items (see `MultimodalMixin`)
+    #   - `supports_thinking_budget`    : the `thinking_budget` / `reasoning_token_ids` kwargs
+    #     force the end of the reasoning block once the budget is spent
+    #   - `supports_banned_tokens`  : the `banned_tokens` kwarg (token ids) is never generated
     supports_streaming  = False
     supports_guided_decoding    = False
     supports_stop_condition     = False
+    supports_stop_words         = False
+    supports_multimodal_data    = False
+    supports_thinking_budget    = False
+    supports_banned_tokens      = False
 
     @property
     def base_dtype(self):
@@ -52,15 +65,42 @@ class Runtime(metaclass = ABCMeta):
 
     def __init__(self, path, *, engine = None, reload = False, ** kwargs):
         if engine is None:
-            if path not in self._engines or reload:
-                self._engines[path] = self.load_engine(path, ** kwargs)
-            engine = self._engines[path]
+            # keyed by runtime class as well : the same `path` (e.g. an HF repo id) can be loaded by
+            # several runtimes (`hf` and `trt_llm_api`), whose engines are not interchangeable
+            key = (self.__class__, path)
+            if key not in self._engines or reload:
+                self._engines[key] = self.load_engine(path, ** kwargs)
+            engine = self._engines[key]
         
         self.path   = path
         self.engine = engine
     
     def __repr__(self):
         return '<{} path={}>'.format(self.__class__.__name__, self.path)
+
+    def release(self):
+        """
+            Frees the engine and drops it from the (class-level, **shared**) `_engines` cache.
+
+            Dropping every reference to a `Runtime` is not enough : the cache is keyed by
+            `(runtime class, path)` and lives for the whole process, so the engine — and the VRAM it holds — survives
+            until the interpreter dies. This matters as soon as several engines are loaded in a
+            row (a notebook re-instantiating a runtime after each edit, a benchmark switching
+            models), and is the reason callers should never have to reach into `Runtime._engines`
+            themselves.
+
+            Subclasses owning an external resource (a worker process, a C++ executor) override
+            this to shut it down, then delegate here.
+        """
+        engine, self.engine = self.engine, None
+        if engine is None: return
+
+        # matched by identity rather than by `self.path` : a runtime may have been built around
+        # an already instantiated engine (`build_runtime(..., engine = ...)`, hence `path = None`)
+        for key, cached in tuple(self._engines.items()):
+            if cached is engine: self._engines.pop(key, None)
+
+        return engine
 
     @property
     def compiled_call(self):

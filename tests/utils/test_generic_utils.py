@@ -22,7 +22,8 @@ module it lives in, ``utils/generic_utils.py``) :
   - iteration       : ``create_iterable`` (moved here from ``test_stream``) ;
   - ``inspect`` utilities : ``get_fn_name`` / ``get_args`` / ``get_kwargs`` /
     ``get_annotations`` / ``has_args`` / ``has_kwargs`` / ``signature_to_str`` /
-    ``get_enum_item``.
+    ``get_enum_item`` ;
+  - HF hub : ``resolve_hf_snapshot`` (on a fake HF cache, no network).
 
 Out of scope for now (environment-dependent or pandas-heavy) : ``timestamp_to_str``,
 ``get_module_version``, ``import_submodules``, ``set_display_options`` and the
@@ -48,7 +49,7 @@ from dataclasses import dataclass
 from utils.generic_utils import (
     to_json, convert_to_str, time_to_string, create_iterable,
     get_fn_name, get_args, get_kwargs, get_annotations,
-    has_args, has_kwargs, signature_to_str, get_enum_item,
+    has_args, has_kwargs, signature_to_str, get_enum_item, resolve_hf_snapshot,
 )
 from utils.file_utils import dump_data  # used as a `function` sample for to_json
 
@@ -307,3 +308,49 @@ def test_create_iterable_forwards_kwargs():
     # only signature-matching kwargs are forwarded to a generator function
     assert list(create_iterable(_gen_kwargs, n = 3)) == [0, 1, 2]
     assert list(create_iterable(_gen_kwargs, n = 2, unknown = 'ignored')) == [0, 1]
+
+
+# --- resolve_hf_snapshot ---------------------------------------------------------------
+
+_commit = '0123456789abcdef0123456789abcdef01234567'
+
+def _fake_hf_cache(root, repo_id = 'org/model', files = ('config.json', 'tokenizer.json')):
+    """ Builds the HF cache layout of a fully downloaded `repo_id`, returns its snapshot dir """
+    repo = root / 'models--{}'.format(repo_id.replace('/', '--'))
+    (repo / 'refs').mkdir(parents = True)
+    (repo / 'refs' / 'main').write_text(_commit)
+    snapshot = repo / 'snapshots' / _commit
+    snapshot.mkdir(parents = True)
+    for name in files: (snapshot / name).write_text('{}')
+    return str(snapshot)
+
+def test_resolve_hf_snapshot_cached(tmp_path):
+    pytest.importorskip('huggingface_hub')
+    snapshot = _fake_hf_cache(tmp_path)
+    assert resolve_hf_snapshot('org/model', cache_dir = str(tmp_path)) == snapshot
+
+def test_resolve_hf_snapshot_not_cached(tmp_path):
+    pytest.importorskip('huggingface_hub')
+    assert resolve_hf_snapshot('org/other', cache_dir = str(tmp_path)) == 'org/other'
+
+def test_resolve_hf_snapshot_validate(tmp_path, caplog):
+    pytest.importorskip('huggingface_hub')
+    snapshot = _fake_hf_cache(tmp_path)
+
+    seen = []
+    def validate(path):
+        seen.append(path)
+        return ['the weights']
+
+    with caplog.at_level(logging.WARNING, logger = 'utils.generic_utils'):
+        assert resolve_hf_snapshot('org/model', validate = validate, cache_dir = str(tmp_path)) == 'org/model'
+    assert seen == [snapshot]
+    assert 'the weights' in caplog.text
+
+    assert resolve_hf_snapshot('org/model', validate = lambda _: [], cache_dir = str(tmp_path)) == snapshot
+
+@pytest.mark.parametrize('kind', ['directory', 'non_str'])
+def test_resolve_hf_snapshot_unchanged(tmp_path, kind):
+    path = str(tmp_path) if kind == 'directory' else tmp_path
+    # never validated : a local directory is already the caller's checkpoint
+    assert resolve_hf_snapshot(path, validate = lambda _: ['anything']) is path

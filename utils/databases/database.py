@@ -19,32 +19,48 @@ from ..file_utils import dump_json, load_json
 logger = logging.getLogger(__name__)
 
 class DatabaseLoader(ABCMeta):
+    """
+        Per-path instance cache of the databases : `Database(path)` returns the instance already
+        opened for `path` (restored from its config the first time), unless
+            - `reload = True`   : the instance is re-opened from the disk (and replaces the cached one)
+            - `cache = False`   : a **private** instance, re-opened from the disk and never
+              retained — e.g. the many short-lived per-session logs of the memory layer (the
+              cache is never emptied), or a reader of files written by another process (a cached
+              instance would be stale)
+        In-memory databases (`path = None`) are neither cached nor restored from a config.
+    """
     _instances = {}
-    
-    def __call__(cls, path, * args, reload = False, _nested = False, ** kwargs):
-        # in-memory databases (`path is None`) are neither cached nor restored from a config
+
+    def __call__(cls, path, * args, reload = False, cache = True, _nested = False, ** kwargs):
         if _nested or path is None:
             return super().__call__(path, * args, ** kwargs)
 
+        if not cache:
+            return cls._open_database(path, args, kwargs)
+
         if reload or path not in cls._instances:
-            config = Database.load_config(path)
-            if config:
-                cls_name = config.pop('class_name')
-                if cls_name != cls.__name__:
-                    raise ValueError("Database stored at {} does not match the class !\n  Expected : {}\n  Got : {}".format(path, cls_name, cls.__name__))
-
-                config.pop('path', None)
-
-                args = ()
-                kwargs.update(config)
-            
-            try:
-                cls._instances[path] = super().__call__(path, * args, ** kwargs)
-            except Exception as e:
-                logger.critical('An error occured while loading database {} : {}'.format(path, e))
-                raise e
+            cls._instances[path] = cls._open_database(path, args, kwargs)
 
         return cls._instances[path]
+
+    def _open_database(cls, path, args, kwargs):
+        """ Opens the database stored at `path`, restoring its constructor arguments from its config """
+        config = Database.load_config(path)
+        if config:
+            cls_name = config.pop('class_name')
+            if cls_name != cls.__name__:
+                raise ValueError("Database stored at {} does not match the class !\n  Expected : {}\n  Got : {}".format(path, cls_name, cls.__name__))
+
+            config.pop('path', None)
+
+            args = ()
+            kwargs = {** kwargs, ** config}
+
+        try:
+            return super().__call__(path, * args, ** kwargs)
+        except Exception as e:
+            logger.critical('An error occured while loading database {} : {}'.format(path, e))
+            raise e
 
 class Database(metaclass = DatabaseLoader):
     """

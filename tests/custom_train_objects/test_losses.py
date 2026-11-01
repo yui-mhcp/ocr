@@ -24,26 +24,29 @@ import pytest
 
 keras = pytest.importorskip('keras')
 
-from custom_train_objects.losses import (
-    get_loss, TextLoss, CTCLoss, TacotronLoss, YoloLoss, GE2ELoss,
+from custom_train_objects import losses
+from custom_train_objects.losses import get_loss
+from ._helpers import normalize_object, optional_object, optional_param, requires
+
+# each sub-project only ships the losses it uses
+TextLoss, CTCLoss, TacotronLoss, YoloLoss, GE2ELoss = (
+    optional_object(losses, name) for name in ('TextLoss', 'CTCLoss', 'TacotronLoss', 'YoloLoss', 'GE2ELoss')
 )
-from ._helpers import normalize_object
 
 pytestmark = pytest.mark.keras
 
 
 # instances are built once at collection (keras is available by then)
 _CUSTOM_LOSSES = [
-    pytest.param(
-        'TextLoss',
-        TextLoss(pad_value = 0, eos_value = -1, warmup_tokens = 5, from_logits = True),
+    optional_param(
+        'TextLoss', TextLoss, pad_value = 0, eos_value = -1, warmup_tokens = 5, from_logits = True,
         id = 'text_loss'
     ),
-    pytest.param('CTCLoss', CTCLoss(pad_value = 0), id = 'ctc_loss'),
-    pytest.param('TacotronLoss', TacotronLoss(), id = 'tacotron_loss'),
-    pytest.param('YoloLoss', YoloLoss(), id = 'yolo_loss'),
-    pytest.param(
-        'GE2ELoss', GE2ELoss(mode = 'softmax', distance_metric = 'cosine'), id = 'ge2e_loss'
+    optional_param('CTCLoss', CTCLoss, pad_value = 0, id = 'ctc_loss'),
+    optional_param('TacotronLoss', TacotronLoss, id = 'tacotron_loss'),
+    optional_param('YoloLoss', YoloLoss, id = 'yolo_loss'),
+    optional_param(
+        'GE2ELoss', GE2ELoss, mode = 'softmax', distance_metric = 'cosine', id = 'ge2e_loss'
     ),
 ]
 
@@ -67,6 +70,7 @@ def test_loss_serialization_roundtrip(name, loss, asserts):
 def test_get_loss_crossentropy_passthrough():
     assert get_loss('crossentropy') == 'crossentropy'
 
+@requires(TextLoss, 'TextLoss')
 def test_get_loss_instance_passthrough():
     loss = TextLoss()
     assert get_loss(loss) is loss
@@ -78,6 +82,7 @@ def test_get_loss_unknown_raises():
 
 # --- TextLoss : padding is ignored -------------------------------------------------
 
+@requires(TextLoss, 'TextLoss')
 def test_text_loss_ignores_padding(asserts):
     """ Changing predictions on padded timesteps must not change the loss. """
     K       = keras.ops

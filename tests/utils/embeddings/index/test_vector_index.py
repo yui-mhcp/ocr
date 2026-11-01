@@ -200,3 +200,128 @@ def test_io(index_cls, index_path, asserts):
     asserts.assert_equal(50, len(loaded))
     asserts.assert_equal((50, dim), loaded.shape)
     asserts.assert_equal(emb_1, loaded.embeddings)
+
+
+# --- search strategies (dense / sparse mask) ---------------------------------------
+
+def _naive_top_k(embeddings, query, k, rows = None, metric = 'cosine'):
+    """ Reference search : full scoring, then a stable sort (ties : lowest index first) """
+    embeddings, query = np.asarray(embeddings, 'float64'), np.asarray(query, 'float64')
+    if metric == 'cosine':
+        embeddings = embeddings / np.linalg.norm(embeddings, axis = -1, keepdims = True)
+        query      = query / np.linalg.norm(query, axis = -1, keepdims = True)
+    rows   = np.arange(len(embeddings)) if rows is None else np.asarray(rows)
+    scores = query @ embeddings[rows].T
+    order  = np.argsort(- scores, axis = -1, kind = 'stable')[:, :k]
+    return rows[order], np.take_along_axis(scores, order, -1)
+
+@pytest.mark.parametrize('ratio', [0.02, 0.1, 0.5, 1.0])
+def test_top_k_masked_matches_naive(index_cls, ratio, asserts):
+    rng   = np.random.default_rng(0)
+    emb   = rng.standard_normal((400, 32)).astype('float32')
+    query = rng.standard_normal((3, 32)).astype('float32')
+    rows  = np.sort(rng.choice(400, max(1, int(400 * ratio)), replace = False))
+
+    index = _make(index_cls, metric = 'cosine')
+    index.add(emb)
+
+    for mask in (rows, np.isin(np.arange(400), rows)):
+        indices, scores = index.top_k(query, k = 7, mask = mask)
+        ref_indices, ref_scores = _naive_top_k(emb, query, 7, rows)
+        asserts.assert_equal(ref_indices, ops.convert_to_numpy(indices))
+        np.testing.assert_allclose(ops.convert_to_numpy(scores), ref_scores, atol = 1e-3)
+
+def test_top_k_masked_strategies_agree(asserts):
+    from utils.embeddings.index import NumpyIndex
+
+    rng   = np.random.default_rng(1)
+    emb   = rng.standard_normal((300, 16)).astype('float32')
+    query = rng.standard_normal((2, 16)).astype('float32')
+    rows  = rng.choice(300, 60, replace = False)
+
+    dense, sparse = NumpyIndex(), NumpyIndex()
+    dense.dense_mask_ratio, sparse.dense_mask_ratio = 0., 2.
+    for index in (dense, sparse): index.add(emb)
+
+    for k in (1, 5, 60, 100):
+        d_idx, d_scores = dense.top_k(query, k = k, mask = rows)
+        s_idx, s_scores = sparse.top_k(query, k = k, mask = rows)
+        assert d_idx.shape == (2, min(k, 60))
+        asserts.assert_equal(s_idx, d_idx)
+        np.testing.assert_allclose(d_scores, s_scores, atol = 1e-6)
+
+def test_top_k_empty_mask(index_cls):
+    index = _make(index_cls)
+    index.add(_random_vectors(10, 8))
+    indices, scores = index.top_k(_random_vectors(2, 8, seed = 1), k = 3, mask = [])
+    assert tuple(ops.convert_to_numpy(indices).shape) == (2, 0)
+    assert tuple(ops.convert_to_numpy(scores).shape) == (2, 0)
+
+def test_score_rows(index_cls):
+    rng   = np.random.default_rng(2)
+    emb   = rng.standard_normal((50, 16)).astype('float32')
+    query = rng.standard_normal((2, 16)).astype('float32')
+    index = _make(index_cls, metric = 'cosine')
+    index.add(emb)
+
+    rows = [3, 41, 0, 7]
+    _, ref = _naive_top_k(emb, query, 50)
+    full   = np.asarray(_naive_top_k(emb, query, 50)[0])
+    scores = ops.convert_to_numpy(index.score(query, rows))
+    assert scores.shape == (2, 4)
+    for q in range(2):
+        expected = {int(i) : s for i, s in zip(full[q], ref[q])}
+        # `1e-3` : the keras backend may run the matmul in TF32 on GPU
+        np.testing.assert_allclose(scores[q], [expected[r] for r in rows], atol = 1e-3)
+
+    assert ops.convert_to_numpy(index.score(query, [])).shape == (2, 0)
+
+
+# --- numpy growable buffer ---------------------------------------------------------
+
+def test_numpy_buffer_grows_by_doubling(asserts):
+    from utils.embeddings.index import NumpyIndex
+
+    index, batches = NumpyIndex(metric = 'euclidian'), []
+    for i in range(20):
+        batch = _random_vectors(3, 8, seed = i)
+        batches.append(batch)
+        index.add(batch)
+        assert len(index) == 3 * (i + 1)
+        assert index.capacity >= len(index)
+        asserts.assert_equal(np.concatenate(batches), index.embeddings)
+    # amortized : far fewer re-allocations than additions
+    assert index.capacity < 4 * len(index)
+
+def test_numpy_buffer_never_writes_into_the_caller_array(asserts):
+    from utils.embeddings.index import NumpyIndex
+
+    first = _random_vectors(4, 8, seed = 1)
+    copy  = first.copy()
+    index = NumpyIndex(metric = 'euclidian')
+    index.add(first)
+    index.add(_random_vectors(2, 8, seed = 2))
+    index.add(_random_vectors(2, 8, seed = 3))
+    asserts.assert_equal(copy, first)
+
+def test_numpy_buffer_remove_then_add(asserts):
+    from utils.embeddings.index import NumpyIndex
+
+    index = NumpyIndex(metric = 'euclidian')
+    emb   = _random_vectors(10, 8)
+    index.add(emb[:6])
+    index.add(emb[6:])
+    index.remove([0, 5])
+    index.add(emb[:1])
+    asserts.assert_equal(np.concatenate([emb[1:5], emb[6:], emb[:1]]), index.embeddings)
+
+def test_numpy_buffer_io(index_path, asserts):
+    from utils.embeddings.index import NumpyIndex
+
+    index = NumpyIndex(metric = 'euclidian')
+    for i in range(5): index.add(_random_vectors(3, 8, seed = i))
+    index.save(index_path)
+
+    loaded = NumpyIndex.load(index_path, metric = 'euclidian')
+    asserts.assert_equal(index.embeddings, loaded.embeddings)
+    assert len(np.load(index_path + '.npy')) == 15

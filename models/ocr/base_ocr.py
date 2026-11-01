@@ -24,6 +24,7 @@ from utils.image import HTTPScreenMirror, combine_boxes
 from utils.callbacks import ImageSaver, JSONSaver, FunctionCallback, OCRDisplayer, QueueCallback, apply_callbacks
 from ..core import BaseModel, TextModelMixin, ImageModelMixin
 from .box_filters import filter_boxes
+from .region_tracker import RegionTracker
 from .streaming import (
     StreamState, build_stream_filters, display_stream_results, emit_stream_results,
     filter_text_results
@@ -371,7 +372,7 @@ class BaseOCR(ImageModelMixin, TextModelMixin, BaseModel):
                   duplicate_wait_time  = 0.,
                   rescan_every = None,
 
-                  k    = 5,
+                  k    = 15,
                   max_dist     = 0.2,
                   text_threshold   = -0.2,
                   skip_non_alpha   = True,
@@ -386,12 +387,19 @@ class BaseOCR(ImageModelMixin, TextModelMixin, BaseModel):
             previous detection map, OCR-ises the (box-filtered) new regions, filters the texts,
             then emits the genuinely new results (`state`, logs, `callback` and `callbacks`).
 
+            Two de-duplication pipelines coexist (selected by `stream(track_regions = ...)`) :
+                - `state.tracker` set : the `RegionTracker` (inside the box-filter chain)
+                  handles the spatial + textual de-duplication (cf `region_tracker.py`)
+                - legacy : `last_boxes` IoA filter + `RepetitionFilter` + emitted-texts sets
+
             `kwargs` are forwarded to `self.infer` (generation / box-combination config).
         """
         if verbose: logger.info('Frame #{} ({} boxes)'.format(frame_index, len(boxes['boxes'])))
 
         output = output[:, :, 0]
         if len(boxes['boxes']) == 0:
+            # an empty frame still counts as *scanned* for the tracker : regions age here
+            if state.tracker is not None: state.tracker.observe_empty(output)
             state.set_new_frame(output)
             state.n_skipped += 1
             return
@@ -422,6 +430,8 @@ class BaseOCR(ImageModelMixin, TextModelMixin, BaseModel):
                 time.sleep(duplicate_wait_time)
             return
 
+        if state.tracker is not None: state.tracker.set_frame(output)
+
         res = self.infer(
             {'image' : image, 'boxes' : boxes}, combine = True, box_filters = filters, ** kwargs
         ).get('ocr', [])
@@ -429,28 +439,54 @@ class BaseOCR(ImageModelMixin, TextModelMixin, BaseModel):
         if len(res) == 0:
             state.n_skipped += 1
             return
-        
-        # NOTE : `last_boxes` accumulates *all* OCR-ised boxes, on purpose *before* the text
-        # filtering below : a region whose text is rejected (e.g. a recurring false positive)
-        # is still memorized so `make_emitted_box_filter` stops re-OCR-ising it every frame.
-        emitted_boxes = np.array([ocr_res['boxes'] for ocr_res in res])
-        if state.last_boxes is None:
-            if verbose: logger.info('- 1st emission : {}'.format(state))
-            state.last_boxes = emitted_boxes
-        else:
-            state.last_boxes = np.concatenate([state.last_boxes, emitted_boxes], axis = 0)
 
-        res = [ocr_res for ocr_res in res if filter_text_results(
-            ocr_res,
-            state.emitted_texts,
-            state.last_texts,
-            text_threshold  = text_threshold,
-            k   = k,
-            max_dist    = max_dist,
-            skip_non_alpha  = skip_non_alpha,
-            skip_single_word    = skip_single_word,
-            verbose = verbose
-        )]
+        if state.tracker is not None:
+            # region-tracking pipeline : each OCR-ised box is reported back to its slot,
+            # which decides the emission (new slot / changed content). The generic guards of
+            # `filter_text_results` (strip `</s>`, single word, low-score parts, ...) still
+            # apply, but its emitted-texts / edit-distance de-duplication is disabled
+            # (`reject = set()`, `k = 0`) : that is now the tracker's job.
+            kept = []
+            for ocr_res in res:
+                emittable = filter_text_results(
+                    ocr_res,
+                    set(),
+                    text_threshold  = text_threshold,
+                    k   = 0,
+                    skip_non_alpha  = skip_non_alpha,
+                    skip_single_word    = skip_single_word,
+                    verbose = verbose
+                )
+                if state.tracker.register_text(
+                    state.tracker.resolve(ocr_res['boxes']),
+                    ocr_res['text'],
+                    ocr_res['scores'],
+                    emittable   = emittable
+                ):
+                    kept.append(ocr_res)
+            res = kept
+        else:
+            # NOTE : `last_boxes` accumulates *all* OCR-ised boxes, on purpose *before* the text
+            # filtering below : a region whose text is rejected (e.g. a recurring false positive)
+            # is still memorized so `make_emitted_box_filter` stops re-OCR-ising it every frame.
+            emitted_boxes = np.array([ocr_res['boxes'] for ocr_res in res])
+            if state.last_boxes is None:
+                if verbose: logger.info('- 1st emission : {}'.format(state))
+                state.last_boxes = emitted_boxes
+            else:
+                state.last_boxes = np.concatenate([state.last_boxes, emitted_boxes], axis = 0)
+
+            res = [ocr_res for ocr_res in res if filter_text_results(
+                ocr_res,
+                state.emitted_texts,
+                state.last_texts,
+                text_threshold  = text_threshold,
+                k   = k,
+                max_dist    = max_dist,
+                skip_non_alpha  = skip_non_alpha,
+                skip_single_word    = skip_single_word,
+                verbose = verbose
+            )]
 
         if len(res) == 0:
             if verbose:
@@ -495,7 +531,10 @@ class BaseOCR(ImageModelMixin, TextModelMixin, BaseModel):
                region   = [0.2, 0.05, 0.6, 0.95],
                n_repeat = 2,
                ioa_threshold    = 0.9,
-               
+
+               track_regions    = False,
+               tracker_config   = {},
+
                save = True,
                save_stream  = None,
                save_frames  = None,
@@ -525,6 +564,14 @@ class BaseOCR(ImageModelMixin, TextModelMixin, BaseModel):
                   generation / box-combination / text-filtering config)
                 - `detector_kwargs` are forwarded to `detector.stream(...)` **only** (detector
                   inference + `stream_camera` config, e.g. `use_xla`, `nb_frames`, ...)
+
+            De-duplication pipeline :
+                - `track_regions = True` : the `RegionTracker` (configured by `tracker_config`,
+                  cf `region_tracker.py`) replaces the `RepetitionFilter`, the IoA
+                  "already emitted" filter and the emitted-texts sets (`n_repeat` /
+                  `ioa_threshold` are then ignored)
+                - `track_regions = False` (legacy) : `n_repeat` / `ioa_threshold` /
+                  emitted-texts de-duplication, as before
         """
         state = StreamState(is_file = isinstance(stream, str) and os.path.isfile(stream))
 
@@ -561,9 +608,14 @@ class BaseOCR(ImageModelMixin, TextModelMixin, BaseModel):
             save_in_parallel  = save_in_parallel
         )
         
-        # Initializes the box-filter chain (also registers the `RepetitionFilter` on the state)
+        # Initializes the box-filter chain (also registers the `RepetitionFilter` or the
+        # `RegionTracker` on the state)
         filters = build_stream_filters(
-            filters, state, region = region, n_repeat = n_repeat, ioa_threshold = ioa_threshold
+            filters, state,
+            region  = region,
+            n_repeat    = n_repeat,
+            ioa_threshold   = ioa_threshold,
+            tracker = RegionTracker(** tracker_config) if track_regions else None
         )
 
         logits_filter = ops.convert_to_tensor([self.ukn_token_idx], 'int32')

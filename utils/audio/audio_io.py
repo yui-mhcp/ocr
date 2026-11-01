@@ -13,6 +13,7 @@ import os
 import time
 import queue
 import scipy
+import atexit
 import logging
 import librosa
 import threading
@@ -45,6 +46,9 @@ _write_fn   = {}
 """ Streaming functions (microphone recording / speakers playing) """
 
 _audio_player   = AudioPlayer()
+# best-effort clean shutdown of the persistent `PyAudio` : silences the PortAudio
+# "not terminated" warning on a clean exit. Correctness never depends on it (see `terminate`).
+atexit.register(_audio_player.terminate)
 
 def display_audio(filename, rate = None, play = False, ** kwargs):
     """

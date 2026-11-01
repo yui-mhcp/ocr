@@ -15,8 +15,20 @@ Ported from the original ``unittest`` ``TestTokenizer`` :
   - ``setUp`` -> a ``tokenizer`` fixture (a 150-symbol char-level english tokenizer) ;
   - ``absl.parameterized`` -> ``@pytest.mark.parametrize`` ;
   - the ``tensorflow`` graph test is gated behind ``@pytest.mark.tensorflow`` ;
-  - the (very heavy, network) ``transformers`` round-trip test is gated behind
-    ``pytest.importorskip('transformers')`` + ``@pytest.mark.slow``.
+  - the ``transformers`` parity tests are gated behind ``pytest.importorskip('transformers')``
+    + ``@pytest.mark.slow``, and skipped if the model is not in the HF cache (run them with
+    ``HF_HUB_OFFLINE=1``, in both ``transformers`` 4 and 5 environments) ;
+  - a cached repo id is loaded from its local snapshot directory (no hub request), checked by
+    ``test_transformers_loads_the_local_snapshot`` without any model.
+
+``transformers`` parity : ``Tokenizer.from_transformers_pretrained`` reads the serialized
+``tokenizers`` pipeline (identical in ``transformers`` 4 and 5, which removed the "slow"
+tokenizers). On a varied corpus (code, digits, NFD text, emojis / CJK, chat special tokens) the
+ids must be identical with and without the default special tokens (inferred from the
+post-processor), and the decoded text identical to ``decode(clean_up_tokenization_spaces =
+False)``. Accepted differences are documented in the tests (BERT decoder clean-up, trailing
+``▁`` of the ``transformers`` 4 sentencepiece fast tokenizers, Llama-2 / vigostral compared to
+the sentencepiece model as ``transformers`` 5 drops its leading ``▁``).
 
 NOTE : the original ``_test_format`` (disabled via its leading underscore) is **not**
 ported — it exercised a ``Tokenizer.format`` method that no longer exists, so it would
@@ -39,11 +51,14 @@ special tokens were never actually removed. Now ``_skip`` is a ``set`` of the id
 """
 
 import os
+import functools
 
 import numpy as np
 import pytest
 
 from utils.text import default_english_tokenizer, en_symbols, Tokenizer
+from utils.text.tokenizer import _gpt_pattern
+from utils.text.text_processing import bytes_to_unicode
 
 _default_texts = [
     "Hello World !",
@@ -327,31 +342,251 @@ def test_tf_function(asserts, tokenizer):
     )
 
 
-# --- `transformers` round-trip (heavy / network) -----------------------------------
+# --- byte-level BPE (synthetic, no `transformers`) ---------------------------------
+
+def _byte_bpe_tokenizer(merges, ** kwargs):
+    """ Byte-level BPE tokenizer whose vocab = the 256 bytes + the merged symbols """
+    byte_encoder = bytes_to_unicode()
+    vocab = list(byte_encoder.values()) + [''.join(pair) for pair in merges]
+    return Tokenizer(
+        vocab,
+        level           = 'token',
+        bpe_pairs       = merges,
+        byte_encoder    = byte_encoder,
+        split_pattern   = _gpt_pattern,
+        ** kwargs
+    )
+
+def test_bpe_without_special_tokens(asserts):
+    """ Regression : without special tokens, `split_text` returned the words as if they were
+    special tokens, so BPE was never applied. """
+    tokenizer = _byte_bpe_tokenizer([('l', 'l'), ('e', 'll'), ('Ġ', 'w')])
+    asserts.assert_equal(['h', 'ell', 'o', 'Ġw', 'o', 'r', 'l', 'd'], tokenizer.tokenize('hello world'))
+    asserts.assert_equal('hello world', tokenizer.decode(tokenizer.encode('hello world')))
+
+def test_bpe_ignore_merges(asserts):
+    """ `ignore_merges` (Llama-3) : a word in the vocab is used as is, even if the merges would split it. """
+    # `abc` is in the vocab, but the merges only produce `ab` + `c`
+    merges = [('a', 'b'), ('b', 'c'), ('a', 'bc')]
+    asserts.assert_equal(['ab', 'c'], _byte_bpe_tokenizer(merges).tokenize('abc'))
+    asserts.assert_equal(['abc'], _byte_bpe_tokenizer(merges, ignore_merges = True).tokenize('abc'))
+
+def test_bpe_cache_is_bounded(asserts, monkeypatch):
+    tokenizer = _byte_bpe_tokenizer([('l', 'l')])
+    monkeypatch.setattr(tokenizer, 'bpe_cache_size', 4)
+    for i in range(20): tokenizer.tokenize('word{}'.format(i))
+    assert len(tokenizer._bpe_cache) <= 4
+    asserts.assert_equal(['h', 'e', 'll', 'o'], tokenizer.tokenize('hello'))
+
+def test_byte_level_special_tokens_decode(asserts):
+    """ Special tokens are decoded from their raw content (not byte-decoded), even with non-ASCII characters. """
+    tokenizer = _byte_bpe_tokenizer([], additional_tokens = ['<|im_start|>', '<|é_tok|>'])
+    ids = tokenizer.encode('<|im_start|>héllo<|é_tok|>', return_type = 'list')
+    asserts.assert_equal(tokenizer['<|im_start|>'], ids[0])
+    asserts.assert_equal(tokenizer['<|é_tok|>'], ids[-1])
+    asserts.assert_equal('<|im_start|>héllo<|é_tok|>', tokenizer.decode(ids))
+    asserts.assert_equal('héllo', tokenizer.decode(ids, remove_tokens = True))
+
+def test_byte_level_truncated_utf8(asserts):
+    """ A sequence cut in a multi-byte character drops it, the rest is decoded normally. """
+    tokenizer = _byte_bpe_tokenizer([])
+    ids = tokenizer.encode('café', return_type = 'list')
+    asserts.assert_equal('caf', tokenizer.decode(ids[: -1]))
+
+
+# --- default SOS / EOS and config compatibility ------------------------------------
+
+def test_add_sos_add_eos_defaults(asserts, tokenizer):
+    config = {** tokenizer.get_config(), 'add_sos' : True, 'add_eos' : False}
+    sos_only = Tokenizer(** config)
+    base = tokenizer.encode('Hi', cleaned = True, add_sos_and_eos = False, return_type = 'list')
+
+    asserts.assert_equal([sos_only.sos_token_idx] + base, sos_only.encode('Hi', cleaned = True, return_type = 'list'))
+    # explicit arguments still override the defaults
+    asserts.assert_equal(base, sos_only.encode('Hi', cleaned = True, add_sos_and_eos = False, return_type = 'list'))
+    asserts.assert_equal(
+        base + [sos_only.eos_token_idx], sos_only.encode('Hi', cleaned = True, add_sos = False, add_eos = True, return_type = 'list')
+    )
+
+def test_legacy_config(asserts, tokenizer, temp_dir):
+    """ A config saved before `ignore_merges` / `add_sos` / `add_eos` behaves as before (`use_sos_and_eos`). """
+    config = tokenizer.get_config()
+    for key in ('ignore_merges', 'add_sos', 'add_eos'): config.pop(key)
+    legacy = Tokenizer(** config)
+
+    asserts.assert_equal(None, legacy.add_sos)
+    for text in _default_texts:
+        asserts.assert_equal(tokenizer.encode(text), legacy.encode(text))
+
+
+# --- decoding (input types) --------------------------------------------------------
+
+def test_decode_input_types(asserts, tokenizer):
+    ids = tokenizer.encode('Hi', cleaned = True, add_sos_and_eos = False, return_type = 'list')
+    # list of `np.integer` (used to be handled as a nested batch)
+    asserts.assert_equal('Hi', tokenizer.decode([np.int64(i) for i in ids]))
+    asserts.assert_equal('Hi', tokenizer.decode(tuple(ids)))
+    # single id and empty sequences
+    asserts.assert_equal('H', tokenizer.decode(ids[0]))
+    asserts.assert_equal('', tokenizer.decode([]))
+    asserts.assert_equal('', tokenizer.decode(np.zeros((0, ), dtype = np.int32)))
+
+
+# --- `transformers` parity (heavy, needs the models in the HF cache) ---------------
+
+_parity_corpus = _default_texts + [
+    "Bonjour à tous, comment ça va aujourd'hui ? Très bien, merci.",
+    "Le prix est de 12345,67 € (soit 3.14159 * 2024).",
+    "I'LL DO IT, DON'T WORRY. She's here, they're gone.",
+    "def foo(x):\n    return x ** 2\n\n\nclass Bar:\n\tpass\r\n",
+    "Emojis 😀🎉 et CJK 中文字符 테스트 русский",
+    "   multiple   spaces   and trailing  ",
+    "naïve café — « guillemets » … ½ ﬁ Å",
+    "Décomposé (NFD) : été, café",
+    "line1\n\nline2\n \n  line3",
+    "CamelCaseIdentifier snake_case_name HTTPServerError 1234567890",
+    "## Titre\n\n- **gras** et `code` : [lien](https://example.com/a?b=1&c=2)\n",
+    "<|im_start|>user\nSalut !<|im_end|>\n<|im_start|>assistant\n",
+]
+
+_parity_models = [
+    'nvidia/Qwen3.8-27B-NVFP4',
+    'meta-llama/Meta-Llama-3.1-8B-Instruct',
+    'mistralai/Mistral-Small-3.1-24B-Instruct-2503',
+    'BAAI/bge-m3',
+    'google/flan-t5-large',
+    'bofenghuang/vigostral-7b-chat',
+    'bert-base-cased',
+    'bert-base-uncased',
+    'gpt2',
+    'facebook/bart-large',
+    'openai/whisper-base',
+    'moussaKam/barthez',
+]
+
+@functools.cache
+def _load_parity_pair(model_name):
+    """ Returns `(reference, tokenizer)`, `rstrip = False` being required for an exact equivalence """
+    transformers = pytest.importorskip('transformers')
+    try:
+        reference = transformers.AutoTokenizer.from_pretrained(model_name)
+    except OSError as e:
+        pytest.skip('{} is not available : {}'.format(model_name, e))
+    return reference, Tokenizer.from_transformers_pretrained(model_name, rstrip = False)
+
+def _reference_fns(model_name, reference, tokenizer):
+    """ Returns the reference `(encode(text, add_special_tokens), decode(ids))` functions """
+    if 'vigostral' in model_name:
+        # `transformers >= 5` drops the leading `▁` of Llama-2 sentencepiece models without
+        # `tokenizer.json` : the sentencepiece model itself is the reference
+        sp_model = tokenizer.tokenizer
+        return (
+            lambda text, special: ([reference.bos_token_id] if special else []) + sp_model.encode(text),
+            sp_model.decode
+        )
+    return (
+        lambda text, special: reference.encode(text, add_special_tokens = special),
+        lambda ids: reference.decode(ids, clean_up_tokenization_spaces = False)
+    )
+
+def _skip_text(model_name, tokenizer, text):
+    """ Known (and accepted) differences, see the comments """
+    # transformers 4 fast sentencepiece tokenizers keep a final `▁` for trailing whitespaces,
+    # while sentencepiece itself (and transformers 5) drops it
+    return type(tokenizer).__name__ == 'SentencePieceTokenizer' and text != text.rstrip()
 
 @pytest.mark.slow
-@pytest.mark.parametrize('model_name,use_sos_and_eos,add_eos', [
-    ('facebook/bart-large',          None,  None),
-    ('moussaKam/barthez',            None,  None),
-    ('bert-base-uncased',            None,  None),
-    ('bert-base-cased',              None,  None),
-    ('gpt2',                         False, None),
-    ('tiiuae/falcon-7b',             False, None),
-    ('google/flan-t5-large',         None,  None),
-    ('BAAI/bge-m3',                  None,  None),
-    ('bofenghuang/vigostral-7b-chat', True, False),
-])
-def test_transformers_tokenizer(asserts, model_name, use_sos_and_eos, add_eos):
+@pytest.mark.parametrize('model_name', _parity_models)
+def test_transformers_parity(asserts, model_name):
     transformers = pytest.importorskip('transformers')
+    if model_name == 'moussaKam/barthez' and int(transformers.__version__.split('.')[0]) >= 5:
+        pytest.xfail('`transformers >= 5` fails to convert the BARThez tokenizer (upstream bug)')
 
-    reference = transformers.AutoTokenizer.from_pretrained(model_name)
-    encoder   = Tokenizer.from_transformers_pretrained(model_name)
+    reference, tokenizer = _load_parity_pair(model_name)
+    ref_encode, ref_decode = _reference_fns(model_name, reference, tokenizer)
 
-    if use_sos_and_eos is not None:
-        encoder.use_sos_and_eos = use_sos_and_eos
+    for text in _parity_corpus:
+        if _skip_text(model_name, tokenizer, text): continue
 
-    for sent in _default_texts:
-        asserts.assert_equal(reference.tokenize(sent), encoder.tokenize(sent))
+        ids = ref_encode(text, False)
         asserts.assert_equal(
-            reference(sent)['input_ids'], encoder.encode(sent, add_eos = add_eos)
+            ids, tokenizer.encode(text, add_sos_and_eos = False, return_type = 'list'), msg = repr(text)
         )
+        # default special tokens (inferred from the post-processor). `add_sos is None` means that
+        # it cannot be represented (e.g., the 2-tokens Whisper prefix) : the legacy behavior is kept
+        if tokenizer.add_sos is not None:
+            asserts.assert_equal(ref_encode(text, True), tokenizer.encode(text, return_type = 'list'), msg = repr(text))
+        # the WordPiece decoder of `transformers` always cleans up the spaces around punctuation
+        if 'bert' not in model_name:
+            asserts.assert_equal(ref_decode(ids), tokenizer.decode(ids, skip_padding = False), msg = repr(text))
+
+@pytest.mark.slow
+@pytest.mark.parametrize('model_name', [
+    'nvidia/Qwen3.8-27B-NVFP4', 'BAAI/bge-m3', 'bofenghuang/vigostral-7b-chat'
+])
+def test_transformers_decode_stream(asserts, model_name):
+    """ `decode_stream` (token per token) rebuilds exactly `decode_ids`, sentencepiece models included. """
+    _, tokenizer = _load_parity_pair(model_name)
+    assert tokenizer.supports_incremental_decoding
+
+    for text in _parity_corpus:
+        ids = tokenizer.encode(text, return_type = 'list')
+        state, deltas = None, []
+        for i in range(1, len(ids) + 1):
+            full, delta, state = tokenizer.decode_stream(ids[: i], state)
+            deltas.append(delta)
+        asserts.assert_equal(tokenizer.decode_ids(ids), full, msg = repr(text))
+        asserts.assert_equal(full, ''.join(deltas), msg = repr(text))
+
+@pytest.mark.slow
+@pytest.mark.parametrize('model_name,sos,eos', [
+    ('nvidia/Qwen3.8-27B-NVFP4',              False, False),
+    ('meta-llama/Meta-Llama-3.1-8B-Instruct', True,  False),
+    ('bert-base-uncased',                     True,  True),
+    ('google/flan-t5-large',                  False, True),
+])
+def test_transformers_special_tokens(asserts, model_name, sos, eos):
+    """ The default SOS / EOS come from the post-processor, and `rstrip` is disabled for chat models. """
+    tokenizer = Tokenizer.from_transformers_pretrained(model_name)
+    asserts.assert_equal(sos, tokenizer.add_sos)
+    asserts.assert_equal(eos, tokenizer.add_eos)
+    if tokenizer.template is not None:
+        asserts.assert_equal(False, tokenizer.rstrip)
+
+@pytest.mark.slow
+def test_transformers_save_load(asserts, temp_dir):
+    """ The converted config (cleaners, split pattern, `ignore_merges`, ...) survives a save / load. """
+    _, tokenizer = _load_parity_pair('nvidia/Qwen3.8-27B-NVFP4')
+    path = os.path.join(temp_dir, 'qwen_tokenizer.json')
+    tokenizer.save(path)
+    loaded = Tokenizer.load_from_file(path)
+
+    for text in _parity_corpus:
+        ids = tokenizer.encode(text, return_type = 'list')
+        asserts.assert_equal(ids, loaded.encode(text, return_type = 'list'))
+        asserts.assert_equal(tokenizer.decode(ids), loaded.decode(ids))
+
+@pytest.mark.parametrize('cached', [True, False])
+def test_transformers_loads_the_local_snapshot(monkeypatch, cached):
+    """ `transformers` receives the snapshot directory of a cached repo id, the repo id otherwise """
+    transformers = pytest.importorskip('transformers')
+    from utils.text import tokenizer as tokenizer_module
+
+    snapshot = '/hf/cache/models--org--model/snapshots/abc'
+    resolved = []
+    def resolve(name, *, validate = None, ** kwargs):
+        resolved.append((name, kwargs))
+        return snapshot if cached else name
+
+    loaded = []
+    def from_pretrained(name, ** kwargs):
+        loaded.append(name)
+        return 'processor'
+
+    monkeypatch.setattr(tokenizer_module, 'resolve_hf_snapshot', resolve)
+    monkeypatch.setattr(transformers.AutoProcessor, 'from_pretrained', from_pretrained)
+
+    result = tokenizer_module._load_transformers_tokenizer('org/model', revision = 'v1', fix_mistral_regex = True)
+    assert result == 'processor'
+    assert resolved == [('org/model', {'revision' : 'v1'})]
+    assert loaded == [snapshot if cached else 'org/model']

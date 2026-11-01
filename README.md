@@ -2,9 +2,9 @@
 
 ![Python](https://img.shields.io/badge/python-3.12-blue.svg)
 ![License](https://img.shields.io/badge/licence-AGPL--3.0-green.svg)
-![Version](https://img.shields.io/badge/version-1.0.0-orange.svg)
+![Version](https://img.shields.io/badge/version-1.1.0-orange.svg)
 
-Check the [CHANGELOG](https://github.com/yui-mhcp/yui-mhcp/blob/main/CHANGELOG.md) file to have a global overview of the latest modifications! :yum:
+Check the [CHANGELOG](CHANGELOG.md) file for the latest updates of this project, and the [global CHANGELOG](https://github.com/yui-mhcp/yui-mhcp/blob/main/CHANGELOG.md) for a cross-project overview ! :yum:
 
 ## Project structure
 
@@ -51,6 +51,7 @@ Check the [CHANGELOG](https://github.com/yui-mhcp/yui-mhcp/blob/main/CHANGELOG.m
 │   │   ├── base_ocr.py              : abstract base class for all OCR models
 │   │   ├── box_filters.py           : filtering / post-processing of detected text boxes
 │   │   ├── crnn.py                  : CRNN implementation for text recognition
+│   │   ├── region_tracker.py        : spatial memory of the text regions for streaming de-duplication (experimental)
 │   │   └── streaming.py             : OCR over a stream of images
 │   └── weights_converter.py     : utilities to convert weights between different models
 ├── pretrained_models        : pretrained checkpoints (`crnn_en`, `east`, `yolo_coco`)
@@ -59,11 +60,13 @@ Check the [CHANGELOG](https://github.com/yui-mhcp/yui-mhcp/blob/main/CHANGELOG.m
 ├── ocr.ipynb                : notebook demonstrating model creation + OCR features
 ├── text.jpg                 : example image used by the notebook
 ├── CHANGELOG.md             : project-specific changelog
+├── CITATION.cff             : citation metadata
 ├── CONTRIBUTING.md          : contribution guidelines
 ├── INSTALLATION.md          : shared GPU environment installation guide
 ├── LICENCE                  : project license file
 ├── pyproject.toml           : project metadata, dependencies and tooling config
-└── README.md                : this file
+├── README.md                : this file
+└── __version__.py           : single-source project version
 ```
 
 \* The `loggers`, `utils` and most of the `tests` tree are the shared foundation maintained in [the data_processing repository](https://github.com/yui-mhcp/data_processing) — check it for more information on these modules.
@@ -185,6 +188,7 @@ Tests are annotated with markers (declared in `pyproject.toml`) so the suite ada
 - [ ] Add an example to perform OCR on camera
 - [x] Allow to combine texts in lines / paragraphs (as EAST detects individual words)
 - [ ] Take into account the text rotation in the combination procedure
+- [x] Track the text regions across frames to avoid re-emitting the same texts in streaming (`stream(track_regions = True)`, experimental)
 
 ## Notes and references 
 

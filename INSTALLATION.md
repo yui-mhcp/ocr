@@ -5,18 +5,17 @@ deep-learning backends) shared by every `yui-mhcp` project. It is **project-agno
 once the environment is ready, install a given project with the short *Installation*
 section of its own `README.md` (typically `pip install -e .[<extras>]`).
 
-> **Versions.** The exact versions below (CUDA 13.1, `torch` cu130, `tensorrt_llm < 1.3`,
-> the Blackwell TensorFlow wheel) are a **known-working combination tested on 2026-07**.
-> Adjust them to your GPU / CUDA using the linked archives.
-
-> **TensorRT-LLM.** Any `tensorrt_llm < 1.3` works. `1.2.1` is tested but its `int8` path
-> is broken on Blackwell (RTX 50xx) ; `1.1.0` is fully tested and works everywhere.
+> **Versions.** The exact versions below (CUDA 13.1 toolkit, `tensorrt_llm 1.3.0rc29` with
+> `torch 2.14` cu132, the Blackwell TensorFlow wheel) are a **known-working combination tested
+> on 2026-10**. Adjust them to your GPU / CUDA using the linked archives.
 
 > **Distribution.** Commands target **Debian 13**; adapt the package-manager steps on other
 > distributions.
 
-> **Backends.** This guide installs *all* backends (PyTorch, TensorRT-LLM, TensorFlow) for a
-> full workstation. You only need the one(s) your target project uses — see its `README.md`.
+> **Backends.** You only need the backend(s) your target project uses — see its `README.md`
+> and the matching subsection of [§4](#4-python-environment) : TensorRT-LLM for
+> `language_models`, TensorFlow for almost all the others, or both to combine an LLM with
+> another project.
 
 ## 1. System packages
 
@@ -77,7 +76,9 @@ wget https://developer.download.nvidia.com/compute/cuda/13.1.0/local_installers/
 sudo sh cuda_13.1.0_590.44.01_linux.run
 ```
 
-## 4. Mamba (conda-forge)
+## 4. Python environment
+
+### Mamba (conda-forge)
 
 ```bash
 mkdir -p installations
@@ -124,50 +125,93 @@ EOF
 
 Re-activate to apply: `mamba deactivate && mamba activate yui`.
 
-## 5. Deep-learning backends
+### Base libraries
 
 ```bash
 pip install jupyter jupyterlab notebook
-
-# PyTorch built for CUDA 13.x
-pip install torch==2.10.0 torchvision --index-url https://download.pytorch.org/whl/cu130
-
-# TensorRT-LLM (from the NVIDIA index). --ignore-installed avoids re-pulling torch.
-# See the "Versions" note above re: 1.2.1 int8 on Blackwell vs 1.1.0.
-pip install "tensorrt_llm<1.3" --extra-index-url https://pypi.nvidia.com --ignore-installed
-# Only if `import tensorrt_llm` fails afterwards:
-pip install pynvml==11.5.3
-
-# TensorFlow with CUDA. Install AFTER TRT-LLM to keep matching cuda/cudnn versions.
-pip install --upgrade tensorflow[and-cuda]
 ```
 
-### Blackwell GPUs (RTX 50xx)
+Then install the backend(s) your project needs, from the subsections below.
 
-TensorFlow 2.20 is not yet compiled with Blackwell support — install a custom wheel:
+### TensorRT-LLM (`language_models`)
+
+```bash
+# TensorRT-LLM (NVIDIA index) pulls `torch` and `torchvision` built for CUDA 13.2 (PyTorch index)
+pip install tensorrt_llm==1.3.0rc29 \
+    --extra-index-url https://download.pytorch.org/whl/cu132 \
+    --extra-index-url https://pypi.nvidia.com
+```
+
+### TensorFlow (almost all the other projects)
+
+```bash
+pip install tensorflow[and-cuda]
+```
+
+#### Blackwell GPUs (RTX 50xx)
+
+TensorFlow 2.20 is not yet compiled with Blackwell support — install a custom wheel instead,
+with its `[and-cuda]` extra (the CUDA 12 libraries):
 
 ```bash
 # python 3.12 wheel:
-pip install tensorflow-2.20.0dev0+selfbuild-cp312-cp312-linux_x86_64.whl
+pip install "tensorflow-2.20.0dev0+selfbuild-cp312-cp312-linux_x86_64.whl[and-cuda]"
 ```
 
 Download it from [this release](https://github.com/mypapit/tensorflowRTX50/releases)
 (3.11 / 3.12 / 3.13 builds also available
 [here](https://github.com/nhsmit/tensorflow-rtx-50-series/releases/tag/2.20.0dev)).
 
-## 6. Verify the GPU
+### TensorRT-LLM + TensorFlow (an LLM combined with another project)
+
+Install [TensorRT-LLM](#tensorrt-llm-language_models) **first**, then
+[TensorFlow](#tensorflow-almost-all-the-other-projects) (Blackwell wheel included), to keep
+matching cuda / cudnn versions.
+
+**Blackwell wheel only — load TensorFlow with `RTLD_LOCAL`.** The custom wheel is a static
+build : it loads its native library with `RTLD_GLOBAL`, which exports its own LLVM (21) to the
+whole process. When `triton` (LLVM 23, imported by `torch` / `transformers` / TensorRT-LLM) is
+loaded **after** TensorFlow, it binds to these symbols and the process crashes with a
+*Segmentation fault* in `triton/knobs.py`. The hook below makes TensorFlow fall back to the
+default `RTLD_LOCAL` flags, without modifying TensorFlow (so it survives its re-installation) :
+
+```bash
+SITE_PACKAGES=$(python -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")
+
+cat > "$SITE_PACKAGES/_tf_rtld_local.py" <<'EOF'
+""" Load TensorFlow with `RTLD_LOCAL` : its `RTLD_GLOBAL` LLVM symbols crash `triton` """
+import os
+import sys
+import types
+
+if os.environ.get('TF_RTLD_GLOBAL', '0') != '1':
+    _name = 'tensorflow.python.pywrap_dlopen_global_flags'
+    _module = types.ModuleType(_name, __doc__)
+    _module.set_dlopen_flags   = lambda: None
+    _module.reset_dlopen_flags = lambda: None
+    sys.modules.setdefault(_name, _module)
+EOF
+
+echo "import _tf_rtld_local" > "$SITE_PACKAGES/_tf_rtld_local.pth"
+```
+
+`TF_RTLD_GLOBAL=1` restores the original behavior : it is only required by custom ops loaded
+with `tf.load_op_library`.
+
+## 5. Verify the GPU
 
 ```bash
 mamba activate yui
 ```
 
 ```python
+# TensorFlow
 import tensorflow as tf
 print('GPU available (tensorflow):', tf.config.list_physical_devices('GPU') != [])
 
-# If installed:
-# import torch;         print('GPU available (torch):', torch.cuda.is_available())
-# import tensorrt_llm
+# TensorRT-LLM : imported AFTER tensorflow, this also checks the `RTLD_LOCAL` hook
+import torch, torch._dynamo, tensorrt_llm
+print('GPU available (torch):', torch.cuda.is_available())
 ```
 
 Start Jupyter:

@@ -91,7 +91,11 @@ def cosine_similarity(x, y, *, as_matrix = False):
 
 @similarity_method_wrapper(name = 'dp')
 def dot_product(x, y, *, as_matrix = False):
-    if as_matrix: return ops.einsum('...ik, ...jk -> ...ij', x, y)
+    if as_matrix:
+        # `matmul` (BLAS) for the common 2-D case : the numpy `einsum` does not use BLAS and is
+        # ~3x slower on a (1, d) x (n, d) similarity matrix (the vector-index search)
+        if len(ops.shape(y)) == 2: return ops.matmul(x, ops.transpose(y))
+        return ops.einsum('...ik, ...jk -> ...ij', x, y)
     return ops.einsum('...j, ...j -> ...', x, y)
 
 @distance_method_wrapper

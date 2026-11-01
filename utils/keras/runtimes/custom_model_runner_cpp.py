@@ -21,7 +21,7 @@ from typing import List, Optional, Union, Callable
 # `trtllm.SamplingConfig` is a pybind11 class : `inspect` cannot introspect its `__init__`,
 # the accepted parameters are therefore derived from its attributes
 _sampling_params = {k for k in vars(trtllm.SamplingConfig).keys() if not k.startswith('_')}
-_rename_params   = {"num_beams": "beam_width", "random_seed": "seed"}
+_rename_params   = {"num_beams": "beam_width", "random_seed": "seed", "min_new_tokens": "min_tokens"}
 # the legacy names are not attributes of `SamplingConfig` : they have to be accepted *before*
 # being renamed, otherwise they are silently dropped by the filtering
 _accepted_params = _sampling_params | set(_rename_params)

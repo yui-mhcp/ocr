@@ -10,9 +10,10 @@
 # limitations under the License.
 
 from ...keras import ops
-from .vector_index import VectorIndex, mask_to_indices
+from .vector_index import VectorIndex
 
 class TorchIndex(VectorIndex):
+    """ `VectorIndex` over a `torch.Tensor` (the search strategies are those of `VectorIndex`) """
     def concat_embeddings(self, embeddings):
         """ Concatenate a list of embeddings """
         import torch
@@ -24,60 +25,30 @@ class TorchIndex(VectorIndex):
         if len(embeddings.shape) == 1: embeddings = embeddings.unsqueeze(0)
         return embeddings
 
-    def add(self, embeddings, ** kwargs):
-        """ Add `vectors` to the index """
+    def _normalize(self, embeddings):
         import torch
-        
-        embeddings = self.prepare_embeddings(embeddings)
-        if self.metric == 'cosine':
-            embeddings = embeddings / torch.norm(embeddings, dim = 1, keepdim = True)
-        
-        if len(self._embeddings) == 0:
-            self.embeddings = [embeddings]
-        elif embeddings.shape[-1] != self.embedding_dim:
-            raise ValueError('Expected dim {}, got {}'.format(
-                self.embedding_dim, embeddings.shape[-1]
-            ))
-        elif isinstance(self._embeddings, list):
-            self._embeddings.append(embeddings)
-        else:
-            self._embeddings = [self._embeddings, embeddings]
+        return embeddings / torch.norm(embeddings, dim = 1, keepdim = True)
 
-    def top_k(self, query, k = 10, *, mask = None, ** kwargs):
-        """
-            Returns a tuple `(top_k_indices, top_k_scores)`
-            
-            Arguments :
-                - query : a 2-D `Tensor` with shape `(n_queries, vector_size)`
-                - k     : the number of best items to retrieve
-                - mask  : subset of candidate rows (see `VectorIndex.top_k`)
-            Return :
-                - indices   : a 2-D `Tensor` of shape `(n_queries, k)`, the indexes of nearest data
-                              When `mask` is provided, this is a `np.ndarray` of **global** indices
-                - scores    : a 2-D `Tensor` of shape `(n_queries, k)`, the scores of the nearest data
-        """
+    def similarity(self, query, embeddings):
         import torch
 
-        query = self.prepare_embeddings(query)
-
-        if mask is not None: mask = mask_to_indices(mask)
-
-        embeddings = self.embeddings if mask is None else self[mask]
-
-        if self.metric == 'dp':
-            distance_matrix = torch.einsum('ik,jk->ij', query, embeddings)
-        elif self.metric == 'cosine':
-            distance_matrix = torch.einsum(
-                'ik,jk->ij', query / torch.norm(query, dim = 1, keepdim = True), embeddings
-            )
-        elif self.metric == 'euclidian':
+        if self.effective_metric == 'dp':
+            return torch.einsum('ik,jk->ij', query, embeddings)
+        elif self.effective_metric == 'euclidian':
             xx = torch.einsum('...i, ...i -> ...', query, query)[:, None]
             yy = torch.einsum('...i, ...i -> ...', embeddings, embeddings)[None, :]
             xy = torch.einsum('ik,jk->ij', query, embeddings)
-            
-            distance_matrix = - torch.sqrt(xx - 2 * xy + yy)
+            return - torch.sqrt(xx - 2 * xy + yy)
+        return super().similarity(query, embeddings)
 
-        dists, indices = torch.topk(distance_matrix, min(k, distance_matrix.shape[1]))
-        if mask is not None:
-            indices = mask[ops.convert_to_numpy(indices)]
+    def _top_k(self, scores, k):
+        import torch
+        dists, indices = torch.topk(scores, k)
         return indices, dists
+
+    def _mask_scores(self, scores, candidates):
+        import torch
+
+        penalty = torch.full((scores.shape[-1], ), float('-inf'), dtype = scores.dtype, device = scores.device)
+        penalty[torch.as_tensor(candidates, device = scores.device)] = 0.
+        return scores + penalty

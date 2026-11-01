@@ -16,8 +16,8 @@ import numpy as np
 from .audio_stream import AudioStream
 
 class AudioPlayer(AudioStream):
-    def __init__(self, rate = None, buffer = None, format = 'float32', ** kwargs):
-        super().__init__(rate, format = format, ** kwargs)
+    def __init__(self, rate = None, buffer = None, format = 'float32', keep_alive = True, ** kwargs):
+        super().__init__(rate, format = format, keep_alive = keep_alive, ** kwargs)
         if buffer is None: buffer = queue.Queue()
         self.buffer = buffer
         

@@ -13,7 +13,7 @@ import os
 import logging
 
 from loggers import Timer, timer
-from utils import Stream, copy_methods, copy_properties, load_json, map_structure
+from utils import Stream, copy_methods, copy_properties, is_dataframe, load_json, map_structure
 from utils.callbacks import apply_callbacks
 from utils.keras import Runtime, TensorSpec, build_runtime
 from custom_train_objects import CheckpointManager, History
@@ -444,11 +444,13 @@ class BaseModel(ModelCheckpointMixin, TrainableModelMixin, ModelProcessingMixin,
 
     def _normalize_prediction_inputs(self, inputs):
         """
-            Wraps single-sample `inputs` into a `list` for `predict`. Sub-classes may extend it
-            for raw array inputs (e.g. rank-1 audio / rank-3 image), which cannot be distinguished
-            from a batch at the `BaseModel` level
+            Wraps single-sample `inputs` into a `list` for `predict`, and converts a `pd.DataFrame`
+            into its rows as `dict` (instead of the `pd.Series` yielded by `Stream`). Sub-classes may
+            extend it for raw array inputs (e.g. rank-1 audio / rank-3 image), which cannot be
+            distinguished from a batch at the `BaseModel` level
         """
         if isinstance(inputs, (str, dict)): return [inputs]
+        if is_dataframe(inputs):            return inputs.to_dict('records')
         return inputs
 
     @timer

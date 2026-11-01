@@ -27,7 +27,7 @@ import pytest
 from loggers.time_logging import (
     TIME_LEVEL, TIME_DEBUG_LEVEL, Timer, timer,
     start_timer, stop_timer, is_timer_running,
-    time_to_string, _root_timer, _timer_to_str
+    time_to_string, _root_timer, _timer_to_str, _get_thread_id
 )
 
 pytestmark = pytest.mark.timeout(10)
@@ -35,7 +35,7 @@ pytestmark = pytest.mark.timeout(10)
 
 def _main_tree():
     """ Returns the timer tree of the current (main) thread """
-    return _root_timer._timers[threading.get_ident()]
+    return _root_timer._timers[_get_thread_id()]
 
 
 # --- time_to_string ----------------------------------------------------------------

@@ -100,15 +100,16 @@ class YOLO(BaseDetector):
 
     @property
     def output_signature(self):
+        """ The training target : `(encoded output, true_boxes)` (see `encode_output`) """
         return (
-            TensorSpec(
-                shape = (None, self.grid_h, self.grid_w, self.nb_box, 5 + self.nb_class),
-                dtype = 'float32'
-            ),
-            TensorSpec(
-                shape = (None, 1, 1, 1, self.max_box_per_image, 4), dtype = 'float32'
-            )
+            TensorSpec(shape = (None, ) + self.target_shape, dtype = 'float32'),
+            TensorSpec(shape = (None, self.max_box_per_image, 4), dtype = 'float32')
         )
+
+    @property
+    def target_shape(self):
+        """ Shape of the encoded target : `(x, y, w, h, confidence, class index)` per anchor """
+        return (self.grid_h, self.grid_w, self.nb_box, 6)
     
     def __str__(self):
         des = super().__str__()
@@ -125,66 +126,30 @@ class YOLO(BaseDetector):
         )
 
     @execute_eagerly(Tout = ('float32', 'float32'), numpy = True)
-    def get_output(self, boxes, labels, nb_box, image_h, image_w):
-        output      = np.zeros(
-            (self.grid_h, self.grid_w, self.nb_box, 5 + self.nb_class), dtype = np.float32
+    def encode_boxes(self, boxes, labels, nb_box, image_h, image_w):
+        """ Encodes the `nb_box` first `boxes` (`xywh`, in pixels) of an image (see `encode_output`) """
+        return encode_output(
+            boxes,
+            labels,
+            nb_box,
+            image_h,
+            image_w,
+            
+            grid_h  = self.grid_h,
+            grid_w  = self.grid_w,
+            anchors = self.np_anchors,
+            label_to_idx    = self.label_to_idx,
+            max_box_per_image   = self.max_box_per_image
         )
-        true_boxes  = np.zeros((self.max_box_per_image, 4), dtype = np.float32)
-        
-        logger.debug("Image with shape ({}, {}) and {} boxes :".format(image_h, image_w, len(boxes)))
-        
-        for i in range(nb_box):
-            x, y, w, h = boxes[i]
-            label_idx = self.labels.index(labels[i]) if labels[i] in self.labels else 0
-
-            center_y = ((y + 0.5 * h) / image_h) * self.grid_h
-            center_x = ((x + 0.5 * w) / image_w) * self.grid_w
-            
-            w = (w / image_w) * self.grid_w  # unit: grid cell
-            h = (h / image_h) * self.grid_h  # unit: grid cell
-            
-            grid_x = int(np.floor(center_x))
-            grid_y = int(np.floor(center_y))
-            
-            logger.debug("Boxes {} ({}) go to grid ({}, {})".format(i, boxes[i], grid_y, grid_x))
-            
-            if w > 0. and h > 0. and grid_x < self.grid_w and grid_y < self.grid_h:
-                box = np.array([center_x, center_y, w, h])
-                yolo_box = np.array([center_x, center_y, w, h, 1.])
-                
-                true_boxes[i % self.max_box_per_image, :] = box
-                
-                # find the anchor that best predicts this box
-                
-                box_wh = np.repeat(np.array([[w, h]]), self.nb_box, axis = 0)
-                
-                intersect = np.minimum(box_wh, self.np_anchors)
-                intersect = intersect[:,0] * intersect[:,1]
-                union = (self.np_anchors[:,0] * self.np_anchors[:,1]) +  (box_wh[:,0] * box_wh[:,1]) - intersect
-                
-                iou = intersect / union
-                
-                best_anchor = np.argmax(iou)
-                
-                logger.debug("Normalized box {} with label {} to anchor idx {} with score {}".format(box, label_idx, best_anchor, iou[best_anchor]))
-                
-                if iou[best_anchor] > 0.:
-                    output[grid_y, grid_x, best_anchor, :5] = yolo_box
-                    output[grid_y, grid_x, best_anchor, 5 + label_idx] = 1
-        
-        return output, true_boxes
     
     def prepare_output(self, infos, ** _):
-        return self.get_output(
+        return self.encode_boxes(
             infos['boxes'],
             infos['label'],
             infos['nb_box'],
             infos['height'],
             infos['width'],
-            shape = [
-                (self.grid_h, self.grid_w, self.nb_box, 5 + self.nb_class),
-                (self.max_box_per_image, 4)
-            ]
+            shape = [self.target_shape, (self.max_box_per_image, 4)]
         )
     
     def get_config(self):
@@ -214,6 +179,84 @@ class YOLO(BaseDetector):
         instance.save()
         
         return instance
+
+def encode_output(boxes,
+                  labels,
+                  nb_box,
+                  image_h,
+                  image_w,
+                  *,
+                  
+                  grid_h,
+                  grid_w,
+                  anchors,
+                  label_to_idx,
+                  max_box_per_image
+                 ):
+    """
+        Encodes the boxes of an image into the YOLO training target
+        
+        Arguments :
+            - boxes     : `np.ndarray` with shape `(n, 4)`, the boxes in the `xywh` format (in pixels)
+            - labels    : (list of) `str` / `bytes`, the label of each box
+            - nb_box    : the number of valid boxes (i.e. the `nb_box` first ones, the others are padding)
+            - image_{h / w} : the image size (in pixels)
+            
+            - grid_{h / w}  : the output grid size
+            - anchors   : `np.ndarray` with shape `(nb_anchors, 2)`, the anchors (in grid cells)
+            - label_to_idx  : `dict` mapping each label to its class index
+            - max_box_per_image : the number of `true_boxes`
+        Return :
+            - output    : `np.ndarray` with shape `(grid_h, grid_w, nb_anchors, 6)`, where each box
+                          is set at its center cell, on its best anchor, as
+                          `(center_x, center_y, w, h, 1, class index)` (in grid cells)
+            - true_boxes    : `np.ndarray` with shape `(max_box_per_image, 4)`, the encoded
+                              `(center_x, center_y, w, h)` of each box (zero-padded)
+        
+        Note : a label unknown from `label_to_idx` is encoded as the class 0
+    """
+    nb_anchors  = len(anchors)
+    output      = np.zeros((grid_h, grid_w, nb_anchors, 6), dtype = np.float32)
+    true_boxes  = np.zeros((max_box_per_image, 4), dtype = np.float32)
+    
+    logger.debug("Image with shape ({}, {}) and {} boxes :".format(image_h, image_w, nb_box))
+    
+    for i in range(nb_box):
+        x, y, w, h = boxes[i]
+        label = labels[i].decode('utf-8') if isinstance(labels[i], bytes) else str(labels[i])
+        label_idx = label_to_idx.get(label, 0)
+
+        center_y = ((y + 0.5 * h) / image_h) * grid_h
+        center_x = ((x + 0.5 * w) / image_w) * grid_w
+        
+        w = (w / image_w) * grid_w  # unit: grid cell
+        h = (h / image_h) * grid_h  # unit: grid cell
+        
+        grid_x = int(np.floor(center_x))
+        grid_y = int(np.floor(center_y))
+        
+        logger.debug("Boxes {} ({}) go to grid ({}, {})".format(i, boxes[i], grid_y, grid_x))
+        
+        if w > 0. and h > 0. and grid_x < grid_w and grid_y < grid_h:
+            box = np.array([center_x, center_y, w, h])
+            
+            true_boxes[i % max_box_per_image, :] = box
+            
+            # find the anchor that best predicts this box
+            intersect = np.minimum(np.array([[w, h]]), anchors)
+            intersect = intersect[:, 0] * intersect[:, 1]
+            union = (anchors[:, 0] * anchors[:, 1]) + (w * h) - intersect
+            
+            iou = intersect / union
+            
+            best_anchor = np.argmax(iou)
+            
+            logger.debug("Normalized box {} with label {} to anchor idx {} with score {}".format(box, label_idx, best_anchor, iou[best_anchor]))
+            
+            if iou[best_anchor] > 0.:
+                output[grid_y, grid_x, best_anchor] = [center_x, center_y, w, h, 1., label_idx]
+    
+    return output, true_boxes
 
 @timer(name = 'output decoding')
 def decode_output(output, *, obj_threshold = 0.35, nms_threshold = 0.2, labels = None, ** kwargs):

@@ -69,8 +69,8 @@ def graph_compile(fn    = None,
         def inner(* args, run_eagerly = None, use_xla = None, recompile = False, ** kwargs):
             other_kwargs = {}
             if not _supports_kwargs:
-                other_kwargs    = {k : v for k, v in kwargs.items() if k not in _signature.parameters}
-                kwargs = {k : v for k, v in kwargs.items() if k in _signature.parameters}
+                other_kwargs    = {k : v for k, v in kwargs.items() if k not in _parameters}
+                kwargs = {k : v for k, v in kwargs.items() if k in _parameters}
 
             inputs = _signature.bind(* args, ** kwargs)
             if logger.isEnabledFor(logging.DEBUG):
@@ -156,7 +156,10 @@ def graph_compile(fn    = None,
         
         _name   = inner.__name__
         _signature  = inspect.signature(inner.__wrapped__)
-        _supports_kwargs    = 'kwargs' in _signature.parameters
+        _parameters = set(list(_signature.parameters))
+        if 'kwargs' in _parameters and hasattr(fn, 'call') and getattr(fn.call, '__module__', '').startswith('keras'):
+            _parameters.remove('kwargs')
+        _supports_kwargs    = 'kwargs' in _parameters
         _annotations    = _get_annotations(inner.__wrapped__)
         
         _compiled   = {'eager' : fn}

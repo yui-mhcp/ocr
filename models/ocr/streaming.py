@@ -19,6 +19,7 @@ from utils.keras import ops
 from utils.text import edit_distance
 from utils.image import compute_ioa, convert_box_format, draw_boxes, show_boxes
 from .box_filters import SizeFilter, RegionFilter, RepetitionFilter
+from .region_tracker import RegionTracker
 
 logger = logging.getLogger(__name__)
 
@@ -48,12 +49,16 @@ class StreamState:
     prev_output : np.ndarray    = field(default = None, repr = False)
 
     repetition_filter   : RepetitionFilter   = None
+    tracker : RegionTracker = None
 
     def set_new_frame(self, output):
         self.prev_output    = output
-        self.last_texts = []
         self.last_boxes = None
         self.n_duplicates   = 0
+        # NOTE : `last_texts` is intentionally *not* cleared here : it feeds the
+        # edit-distance filter, which must survive a (possibly false) scene switch —
+        # otherwise a slight OCR variation of an already-emitted background text passes
+        # the exact-match `emitted_texts` check and is re-emitted right after the switch.
         # NOTE : the `repetition_filter` is intentionally *not* cleared on a scene change.
         # The scene-switch detection (Dice mismatch) is fragile, so a hard reset here would
         # too often drop legitimately-waiting boxes on a false switch.
@@ -114,11 +119,15 @@ def make_emitted_box_filter(state, ioa_threshold):
     return _filter_emitted_boxes
 
 
-def build_stream_filters(filters, state, *, region, n_repeat, ioa_threshold):
+def build_stream_filters(filters, state, *, region, n_repeat, ioa_threshold, tracker = None):
     """
         Builds the default streaming box-filter chain (unless `filters` is already provided),
-        appends the IoA "already emitted" filter, and registers the `RepetitionFilter` (if any)
-        on `state` so `stream_fn` can introspect it.
+        and registers the de-duplication component on `state` so `stream_fn` can use it :
+            - `tracker` provided : the `RegionTracker` is appended as the last filter, and
+              replaces both the `RepetitionFilter` and the IoA "already emitted" filter
+            - otherwise (legacy pipeline) : the IoA filter is *prepended* (cheapest and most
+              discriminant : already-emitted boxes must not pollute the `RepetitionFilter`
+              state), and the `RepetitionFilter` (if any) is registered on `state`
 
         Return : the (possibly built) `filters` list.
     """
@@ -126,13 +135,18 @@ def build_stream_filters(filters, state, *, region, n_repeat, ioa_threshold):
         filters = [SizeFilter(min_h = 0.025, min_w = 0.1)]
         if region:
             filters.append(RegionFilter(region = region, source = 'xyxy', mode = 'center'))
-        if n_repeat:
+        if n_repeat and tracker is None:
             filters.append(RepetitionFilter(n_repeat = n_repeat, use_memory = False))
     elif not isinstance(filters, list):
         filters = [filters]
 
+    if tracker is not None:
+        filters.append(tracker)
+        state.tracker = tracker
+        return filters
+
     if ioa_threshold:
-        filters.append(make_emitted_box_filter(state, ioa_threshold))
+        filters.insert(0, make_emitted_box_filter(state, ioa_threshold))
 
     for f in filters:
         if isinstance(f, RepetitionFilter):

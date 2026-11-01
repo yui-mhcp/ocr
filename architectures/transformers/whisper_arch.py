@@ -13,6 +13,7 @@ import os
 import keras
 import numpy as np
 import keras.ops as K
+from keras.src.backend.common.masking import get_keras_mask, set_keras_mask
 
 from ..simple_models import HParamsConvBN, simple_cnn
 from .transformer_arch import *
@@ -139,18 +140,15 @@ class WhisperEncoder(TransformerBlock):
 
     def prepare_input(self, inputs, training = False, mask = None, ** kwargs):
         embedded = self.feature_extractor(inputs, training = training, mask = mask)
-        if getattr(embedded, '_keras_mask', None) is not None:
-            mask = embedded._keras_mask[:, None, None, :]
+        if get_keras_mask(embedded) is not None:
+            mask = get_keras_mask(embedded)[:, None, None, :]
         else:
             mask = K.ones((K.shape(embedded)[0], 1, 1, K.shape(embedded)[1]), dtype = 'bool')
 
         embedded = embedded + K.cast(
             self.pos_encoding[None, :K.shape(embedded)[1]], embedded.dtype
         )
-        try:
-            embedded._keras_mask = mask
-        except AttributeError:
-            pass
+        set_keras_mask(embedded, mask)
         
         return embedded
 
@@ -293,6 +291,8 @@ def load_whisper(pretrained_name = 'medium', pretrained = None, ** kwargs):
         from utils.file_utils import download_file
         from models import get_pretrained_weights_dir
         
+        if pretrained_name.startswith('openai/'):
+            pretrained_name = pretrained_name.split('/', 1)[1]
         if pretrained_name.startswith('whisper-'):
             pretrained_name = pretrained_name.replace('whisper-', '')
         

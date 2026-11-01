@@ -188,3 +188,102 @@ def test_in_memory(asserts):
 
     # in-memory databases are not cached : a new instance is empty
     asserts.assert_equal(0, len(_make()))
+
+
+# --- columnar filters / mask / rows ------------------------------------------------
+
+def _sourced_db(** kwargs):
+    db = _make(** kwargs)
+    sources = ['a', 'b', 'a', None, 'a', 'b']
+    entries = [{'hash' : 'c-{}'.format(i), 'source' : src, 'n' : i} for i, src in enumerate(sources)]
+    for entry in entries:
+        if entry['source'] is None: entry.pop('source')
+    db.multi_insert(entries, vectors = _linear_vectors([0., 1., 2., 3., 4., 5.]))
+    return db
+
+def _hashes(results):
+    return [res['hash'] for res in results[0]]
+
+def test_filter_kinds(asserts):
+    db    = _sourced_db()
+    query = _linear_vectors([5.])
+
+    asserts.assert_equal(['c-4', 'c-2', 'c-0'], _hashes(db.search(query, k = 5, filters = {'source' : 'a'})))
+    # a collection is a membership test
+    asserts.assert_equal(['c-5', 'c-4', 'c-2'], _hashes(db.search(query, k = 3, filters = {'source' : ['a', 'b']})))
+    asserts.assert_equal(['c-5', 'c-1'], _hashes(db.search(query, k = 5, filters = {'source' : {'b'}})))
+    # `None` matches a missing field
+    asserts.assert_equal(['c-3'], _hashes(db.search(query, k = 5, filters = {'source' : None})))
+    # several filters are combined
+    asserts.assert_equal(['c-2', 'c-0'], _hashes(db.search(
+        query, k = 5, filters = {'source' : 'a', 'n' : lambda n: n < 3}
+    )))
+    # the primary key is a column as well
+    asserts.assert_equal(['c-1'], _hashes(db.search(query, k = 5, filters = {'hash' : 'c-1'})))
+
+def test_columns_follow_the_mutations(asserts):
+    db = _sourced_db()
+    asserts.assert_equal(['a', 'b', 'a', None, 'a', 'b'], list(db.column('source')))
+
+    db.insert({'hash' : 'c-6', 'source' : 'c', 'embedding' : np.full((4, ), 6., 'float32')})
+    db.multi_insert([{'hash' : 'c-7', 'source' : 'c'}], vectors = _linear_vectors([7.]))
+    asserts.assert_equal(['a', 'b', 'a', None, 'a', 'b', 'c', 'c'], list(db.column('source')))
+
+    db.update({'hash' : 'c-0', 'source' : 'z'})
+    asserts.assert_equal('z', db.column('source')[0])
+
+    db.pop('c-1')
+    asserts.assert_equal(['z', 'a', None, 'a', 'b', 'c', 'c'], list(db.column('source')))
+    db.multi_pop(['c-6', 'c-2'])
+    asserts.assert_equal(['z', None, 'a', 'b', 'c'], list(db.column('source')))
+    asserts.assert_equal(['c-0', 'c-3', 'c-4', 'c-5', 'c-7'], list(db.column('hash')))
+
+    results = db.search(_linear_vectors([7.]), k = 5, filters = {'source' : ['c', 'z']})
+    asserts.assert_equal(['c-7', 'c-0'], _hashes(results))
+
+def test_columns_after_reload(db_path, asserts):
+    db = _sourced_db(path = db_path)
+    db.pop('c-0')
+    db.save()
+
+    reloaded = VectorDatabase(db_path, reload = True)
+    asserts.assert_equal(['b', 'a', None, 'a', 'b'], list(reloaded.column('source')))
+    asserts.assert_equal(['c-5', 'c-1'], _hashes(reloaded.search(_linear_vectors([5.]), k = 5, filters = {'source' : 'b'})))
+
+def test_rows(asserts):
+    db = _sourced_db()
+    asserts.assert_equal([2, -1, 0, 5], db.rows(['c-2', 'unknown', {'hash' : 'c-0'}, 'c-5']))
+    db.pop('c-0')
+    asserts.assert_equal([1, -1, 4], db.rows(['c-2', 'c-0', 'c-5']))
+    asserts.assert_equal((0, ), db.rows([]).shape)
+
+def test_search_mask(asserts):
+    db    = _sourced_db()
+    query = _linear_vectors([5.])
+
+    asserts.assert_equal(['c-3', 'c-1'], _hashes(db.search(query, k = 5, mask = [1, 3])))
+    asserts.assert_equal(['c-3', 'c-1'], _hashes(db.search(query, k = 5, mask = np.isin(np.arange(6), [1, 3]))))
+    # combined with the filters
+    asserts.assert_equal(['c-1'], _hashes(db.search(query, k = 5, mask = [1, 2, 3], filters = {'source' : 'b'})))
+    # the `-1` of `rows` (absent keys) are ignored
+    asserts.assert_equal(['c-2'], _hashes(db.search(query, k = 5, mask = db.rows(['c-2', 'nope']))))
+    # an empty candidate set -> 1 empty list per query
+    asserts.assert_equal([[], []], db.search(_linear_vectors([1., 2.]), k = 5, mask = []))
+
+def test_version(asserts):
+    db = _make()
+    v0 = db.version
+    db.multi_insert(_entries(2), vectors = _linear_vectors([0., 1.]))
+    db.update({'hash' : 'chunk-0', 'text' : 'new'})
+    db.pop('chunk-1')
+    assert db.version == v0 + 3
+
+def test_filters_on_a_composite_key_database(asserts):
+    db = VectorDatabase(None, ('model', 'hash'), index = 'numpy', metric = 'euclidian')
+    db.multi_insert(
+        [{'model' : m, 'hash' : str(i), 'kind' : k} for i, (m, k) in enumerate([('x', 'f'), ('y', 'e'), ('x', 'e')])],
+        vectors = _linear_vectors([0., 1., 2.])
+    )
+    results = db.search(_linear_vectors([2.]), k = 3, filters = {'model' : 'x', 'kind' : 'e'})
+    asserts.assert_equal([('x', '2')], [(r['model'], r['hash']) for r in results[0]])
+    asserts.assert_equal([2, 0], db.rows([('x', '2'), ('x', '0')]))

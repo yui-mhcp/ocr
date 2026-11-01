@@ -43,8 +43,11 @@ class TextModelMixin:
     
     @property
     def is_encoder_decoder(self):
-        if self.runtime in ('trt_llm', 'trt_llm_api', 'trt_llm_serve'):
+        if self.runtime in ('trt_llm', 'trt_llm_serve'):
             return self.model.is_enc_dec
+        elif self.runtime == 'trt_llm_api':
+            # no `is_enc_dec` on the LLM API runtime : the checkpoint config is authoritative
+            return bool(getattr(self.model.hf_config, 'is_encoder_decoder', False))
         return getattr(self.model, 'decoder', None) is not None
 
     @property

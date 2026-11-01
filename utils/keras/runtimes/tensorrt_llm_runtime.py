@@ -68,7 +68,28 @@ class TensorRTLLMRuntime(Runtime):
     @property
     def max_input_length(self):
         return self.engine.max_input_len
-    
+
+    def release(self):
+        """
+            Shuts the C++ executor down, on top of the cache eviction of `Runtime.release`.
+
+            `ModelRunnerCpp` holds it in `self.session` and has no `__del__` : without an
+            explicit `shutdown`, the executor (and the VRAM of the engine **and** of its KV
+            cache) survives every dropped reference until the process exits.
+        """
+        engine = super().release()
+
+        if self.multimodal_engine is not None:
+            self.multimodal_engine.release()
+            self.multimodal_engine = None
+
+        if engine is None: return
+
+        session = getattr(engine, 'session', None)
+        if session is not None and hasattr(session, 'shutdown'):
+            session.shutdown()
+            logger.info('Engine `{}` has been released'.format(self.path))
+
     def set_tokens(self, sos_token = None, eos_token = None, pad_token = None):
         if sos_token not in (-1, None): self.sos_token = sos_token
         if eos_token not in (-1, None): self.eos_token = eos_token
@@ -85,12 +106,29 @@ class TensorRTLLMRuntime(Runtime):
                  encoder_output_lengths = None,
                  
                  tokenizer  = None,
+                 stop_words = None,
                  stop_condition = None,
                  allowed_tokens = None,
                  logits_processors  = None,
 
                  ** kwargs
                 ):
+        if stop_words:
+            # declared (and refused) explicitly : left in `** kwargs`, it would be dropped
+            # without a word by the `infer_signature` filter below, and the caller would simply
+            # get a generation that never stops. `ModelRunnerCpp` does expose a `stop_words_list`,
+            # but it takes token *ids* — not the strings `supports_stop_words` promises
+            raise NotImplementedError(
+                '`stop_words` is not supported by `TensorRTLLMRuntime` (see `supports_stop_words`)'
+                ' : use the `stop_condition` callable / regex instead'
+            )
+
+        if tokenizer is not None and self.eos_token in (None, -1):
+            self.set_tokens(
+                sos_token = tokenizer.sos_token_idx,
+                eos_token = tokenizer.eos_token_idx,
+                pad_token = tokenizer.blank_token_idx
+            )
         # `max_beam_width` is the *upper bound* compiled in the engine, not a sensible default :
         # greedy decoding is used unless the caller explicitly asks for beam search
         if num_beams is None: num_beams = 1
@@ -140,13 +178,13 @@ class TensorRTLLMRuntime(Runtime):
                 k : _get_shape(k, v) for k, v in kwargs.items()
             }))
         
-        t0 = time.time()
+        t0 = time.perf_counter()
         result = self.engine.generate(streaming = streaming, ** kwargs)
         
         if streaming:
             result = InferenceStream(self.engine, result)
         elif logger.isEnabledFor(logging.INFO):
-            t1 = time.time()
+            t1 = time.perf_counter()
             n  = sum(sum(len(beam) for beam in beams) for beams in result)
             logger.info('[TRT-LLM] {} tokens generated in {} ({:.3f} tokens/sec)'.format(
                 n, time_to_string(t1 - t0), n / (t1 - t0)
@@ -353,7 +391,10 @@ class LogitsProcessor:
             - `stop_condition`  : a callable on the decoded text that, once matched,
               forces the EOS token
 
-        The processor is stateful (`_step` / `_text`) : create a new instance for each
+        Both can be combined : the not-allowed tokens are masked first, then the stop
+        condition may still force the EOS token.
+
+        The processor is stateful (`_step` / `_decode_state`) : create a new instance for each
         `generate` call (and for each request within a batch).
     """
     def __init__(self, tokenizer, allowed_tokens = None, stop_condition = None):
@@ -362,34 +403,50 @@ class LogitsProcessor:
         self.stop_condition = stop_condition
 
         self._step  = 0
-        self._text  = ''
-        self._allowed_indexes   = None
-
-        if self.allowed_tokens is not None:
-            self.call = self._guided_process_logits
-        elif self.stop_condition is not None:
-            self.call = self._stopper_process_logits
+        self._allowed_mask  = None
+        self._decode_state  = None
+        self._prompt_length = 0
 
     def __call__(self, req_id, logits, ids, stream_ptr, client_id):
         import torch
 
         if stream_ptr is None:
             # pytorch-backend LLM API : the processor already runs on the generation stream
-            self.call(logits, ids)
+            self.process(logits, ids)
         else:
             with torch.cuda.stream(torch.cuda.ExternalStream(stream_ptr)):
-                self.call(logits, ids)
+                self.process(logits, ids)
 
         self._step += 1
 
         return logits
 
+    def process(self, logits, ids):
+        """ Applies the (optional) guided decoding, then the (optional) stop condition """
+        if self.allowed_tokens is not None:
+            self._guided_process_logits(logits, ids)
+
+        if self.stop_condition is not None:
+            self._stopper_process_logits(logits, ids)
+
     def _stopper_process_logits(self, logits, ids):
-        if self._step == 0: return
+        if self._step == 0:
+            # `ids[0]` only holds the prompt at this point : remember where the generated
+            # tokens start, so the stop condition is matched against the answer alone
+            self._prompt_length = len(ids[0])
+            return
 
-        self._text += self.tokenizer.decode_ids(ids[0][-1])
+        # `ids[0]` holds the **cumulated** ids : `decode_stream` decodes only what is new
+        # since the previous step, and carries the incomplete multi-byte tail across steps.
+        # The previous version re-decoded the whole accumulated text at *every* token — O(n^2)
+        # inside the logits callback, i.e. on the generation stream itself — and relied on
+        # `decode_ids` swallowing `UnicodeDecodeError`, which returned raw byte-encoded text
+        # and made accented stop words never match
+        text, _, self._decode_state = self.tokenizer.decode_stream(
+            ids[0][self._prompt_length :], self._decode_state
+        )
 
-        if self.stop_condition(self._text):
+        if self.stop_condition(text):
             # force the EOS token by masking every other one
             eos = self.tokenizer.eos_token_idx
             logits[..., : eos]      = float('-inf')
@@ -398,14 +455,22 @@ class LogitsProcessor:
     def _guided_process_logits(self, logits, ids):
         import torch
 
-        if self._allowed_indexes is None:
-            self._allowed_indexes = torch.as_tensor(
-                list(self.allowed_tokens), dtype = torch.long, device = logits.device
+        if self._allowed_mask is None:
+            # additive `-inf` mask, built once : the previous version allocated a fresh
+            # `ones_like` boolean mask (plus the temporaries of its advanced indexing) at
+            # every single token. `allowed_tokens` is a **padded batch** of encoded answers
+            # (see `BaseLLM._get_generation_config`), hence the flatten + unique
+            allowed = torch.as_tensor(
+                np.unique(np.asarray(self.allowed_tokens).reshape(-1)),
+                dtype = torch.long, device = logits.device
             )
+            self._allowed_mask = torch.full(
+                (logits.shape[-1], ), float('-inf'),
+                dtype = logits.dtype, device = logits.device
+            )
+            self._allowed_mask[allowed] = 0.
 
-        mask = torch.ones_like(logits, dtype = torch.bool)
-        mask[..., self._allowed_indexes] = False
-        logits[mask] = float('-inf')
+        logits += self._allowed_mask
 
 
 def _get_kv_cache_fraction(path, kv_cache_memory):

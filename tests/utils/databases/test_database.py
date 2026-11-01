@@ -16,6 +16,10 @@ Each test takes the ``make_db`` factory (parametrized over ``backend x key`` in
 arities. ``VectorDatabase`` keeps its own suite (``test_vector_database.py``) because its
 signatures differ (it requires embeddings).
 
+Append-only backends (``JSONLDatabase``) skip the mutating tests via the ``mutable`` fixture
+and are checked by ``test_append_only_rejects_mutations`` instead ; their log-specific API
+is covered by ``test_jsonl_database.py``.
+
 Backends and key-builders live in ``_base.py``. The suite is keras-free (unmarked).
 """
 
@@ -71,7 +75,7 @@ def test_get_missing_raises(make_db, key):
 
 # --- update ------------------------------------------------------------------------
 
-def test_update(make_db, key, asserts):
+def test_update(make_db, key, mutable, asserts):
     db = make_db()
     db.insert(make_entry(key, 0))
 
@@ -81,12 +85,12 @@ def test_update(make_db, key, asserts):
     asserts.assert_equal('updated', value['text'])
     asserts.assert_equal('new', value['extra'])
 
-def test_update_missing_raises(make_db, key):
+def test_update_missing_raises(make_db, key, mutable):
     db = make_db()
     with pytest.raises(KeyError):
         db.update(make_entry(key, 0))
 
-def test_insert_or_update(make_db, key, asserts):
+def test_insert_or_update(make_db, key, mutable, asserts):
     db = make_db()
 
     db.insert_or_update(make_entry(key, 0))            # inserts
@@ -108,7 +112,7 @@ def test_setitem_insert(make_db, key, asserts):
     asserts.assert_equal(1, len(db))
     asserts.assert_equal('text 0', db[entry_id(key, 0)]['text'])
 
-def test_setitem_column_update(make_db, key, asserts):
+def test_setitem_column_update(make_db, key, mutable, asserts):
     db = make_db()
     db.insert(make_entry(key, 0))
 
@@ -117,7 +121,7 @@ def test_setitem_column_update(make_db, key, asserts):
     asserts.assert_equal(1, len(db))
     asserts.assert_equal('patched', db[entry_id(key, 0)]['text'])
 
-def test_delitem(make_db, key, asserts):
+def test_delitem(make_db, key, mutable, asserts):
     db = make_db()
     db.insert(make_entry(key, 0))
     db.insert(make_entry(key, 1))
@@ -131,7 +135,7 @@ def test_delitem(make_db, key, asserts):
 
 # --- removal -----------------------------------------------------------------------
 
-def test_pop(make_db, key, asserts):
+def test_pop(make_db, key, mutable, asserts):
     db = make_db()
     db.insert(make_entry(key, 0))
     db.insert(make_entry(key, 1))
@@ -143,7 +147,7 @@ def test_pop(make_db, key, asserts):
     asserts.assert_equal(1, len(db))
     assert entry_id(key, 0) not in db
 
-def test_pop_missing_raises(make_db, key):
+def test_pop_missing_raises(make_db, key, mutable):
     db = make_db()
     with pytest.raises(KeyError):
         db.pop(entry_id(key, 0))
@@ -151,7 +155,7 @@ def test_pop_missing_raises(make_db, key):
 
 # --- batch operations --------------------------------------------------------------
 
-def test_multi_insert_get_pop(make_db, key, asserts):
+def test_multi_insert_get_pop(make_db, key, mutable, asserts):
     db = make_db()
     entries = make_entries(key, 3)
 
@@ -204,7 +208,7 @@ def test_get_column(make_db, key, asserts):
 
 # --- filter ------------------------------------------------------------------------
 
-def test_filter_equality(make_db, key, asserts):
+def test_filter_equality(make_db, key, mutable, asserts):
     db = make_db()
     db.insert(make_entry(key, 0, group = 'a'))
     db.insert(make_entry(key, 1, group = 'b'))
@@ -216,7 +220,7 @@ def test_filter_equality(make_db, key, asserts):
     asserts.assert_equal(1, len(db))
     assert entry_id(key, 1) in db
 
-def test_filter_callable(make_db, key, asserts):
+def test_filter_callable(make_db, key, mutable, asserts):
     db = make_db()
     db.multi_insert([make_entry(key, i, group = g) for i, g in enumerate('abab')])
 
@@ -224,6 +228,41 @@ def test_filter_callable(make_db, key, asserts):
 
     asserts.assert_equal(2, len(db))
     assert entry_id(key, 0) in db and entry_id(key, 2) in db
+
+
+# --- append-only backends ----------------------------------------------------------
+
+def test_append_only_rejects_mutations(make_db, backend, key, asserts):
+    if not backend.append_only:
+        pytest.skip('backend `{}` is not append-only'.format(backend.id))
+
+    db = make_db()
+    db.multi_insert(make_entries(key, 2, group = 'a'))
+
+    with pytest.raises(TypeError):
+        db.update(make_entry(key, 0, text = 'updated'))
+    with pytest.raises(TypeError):
+        db.pop(entry_id(key, 0))
+    with pytest.raises(TypeError):
+        del db[entry_id(key, 0)]
+    with pytest.raises(TypeError):
+        db[entry_id(key, 0), 'text'] = 'patched'
+    with pytest.raises(TypeError):
+        db.insert_or_update(make_entry(key, 0, text = 'v2'))
+    with pytest.raises(TypeError):
+        db.filter(group = 'a')
+    with pytest.raises(TypeError):   # unsupported even when nothing matches
+        db.filter(group = 'unknown')
+
+    # the content is left untouched
+    asserts.assert_equal(2, len(db))
+    assert db[entry_id(key, 0)] == make_entry(key, 0, group = 'a')
+    assert db[entry_id(key, 1)] == make_entry(key, 1, group = 'a')
+
+    # `insert_or_update` / `__setitem__` still work for new keys
+    db[entry_id(key, 2)] = make_entry(key, 2)
+    db.insert_or_update(make_entry(key, 3))
+    asserts.assert_equal(4, len(db))
 
 
 # --- positional indexing (ordered backends only) -----------------------------------

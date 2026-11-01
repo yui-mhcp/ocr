@@ -51,7 +51,8 @@ def _compare_primitive(target, value, max_err = 0., ** kwargs):
     # float comparison must be tolerant whichever side is the float : the reference
     # is often a python/np float while the value is a (0-d) array coming from a tensor.
     if _is_real_scalar(target) or _is_real_scalar(value):
-        assert abs(float(target) - float(value)) <= max_err, \
+        target, value = float(target), float(value)
+        assert target == value or abs(target - value) <= max_err, \
             'Values differ : {} (target {} / value {})'.format(
                 abs(float(value) - float(target)), target, value
             )

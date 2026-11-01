@@ -208,12 +208,14 @@ def test_nested_arg_with_one_tensor_uses_keras(asserts):
 # conventional aliases and disabling numpy for creation ops — all keras-free.
 
 def test_getattr_returns_lazy_ops():
-    """ An arbitrary op is exposed lazily as an `Ops`, resolved keras-free, not built. """
+    """ An arbitrary op is exposed lazily as an `Ops`, resolved keras-free, not built. The `ops.cos`
+        instance is shared by the process (another test may have built it on a tensor) : the laziness
+        is checked on a fresh instance """
     fn = ops.cos
     assert isinstance(fn, Ops)
     assert fn.name == 'cos'
     assert fn.numpy_fn is np.cos
-    assert not fn.built
+    assert not Ops('cos').built
 
 def test_getattr_disables_numpy_for_creation_ops():
     """ Creation ops obtained dynamically always build a tensor (``numpy_fn is None``). """

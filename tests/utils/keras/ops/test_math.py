@@ -116,3 +116,13 @@ def test_segment_weighted_mean(backend, asserts):
         prepare(backend, data), segment_ids, prepare(backend, weights), 2,
         ref = ref, backend = backend, asserts = asserts
     )
+
+
+def test_top_k_numpy_matches_a_stable_sort():
+    rng = np.random.default_rng(0)
+    x   = rng.integers(0, 5, size = (4, 50)).astype('float32')     # many ties
+    for k in (1, 7, 50, 80):
+        values, indices = ops.top_k(x, k)
+        ref = np.argsort(- x, axis = -1, kind = 'stable')[:, :k]
+        np.testing.assert_array_equal(indices, ref)
+        np.testing.assert_array_equal(values, np.take_along_axis(x, ref, -1))

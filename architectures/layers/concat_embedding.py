@@ -12,6 +12,7 @@
 import enum
 import keras
 import keras.ops as K
+from keras.src.backend.common.masking import set_keras_mask
 
 class ConcatMode(enum.IntEnum):
     CONCAT  = 0
@@ -60,10 +61,7 @@ class ConcatEmbedding(keras.layers.Layer):
         if isinstance(mask, (list, tuple)): mask = mask[0]
         if mask is not None:
             out = K.where(K.expand_dims(mask, axis = -1), out, 0.)
-            try:
-                out._keras_mask = mask
-            except AttributeError:
-                pass
+            set_keras_mask(out, mask)
         
         return out
 

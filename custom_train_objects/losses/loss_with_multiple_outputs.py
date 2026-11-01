@@ -14,6 +14,7 @@ import keras.ops as K
 
 from keras import tree
 from keras.src.losses.loss import reduce_weighted_values
+from keras.src.backend.common.masking import get_keras_mask
 
 class LossWithMultipleOutputs(keras.losses.Loss):
     @property
@@ -28,7 +29,7 @@ class LossWithMultipleOutputs(keras.losses.Loss):
             This redefines the reduction strategy to enable subclasses to output multiple losses
         """
         # adapted from https://github.com/keras-team/keras/blob/master/keras/losses/loss.py v3.1.1
-        in_mask = getattr(y_pred, "_keras_mask", None)
+        in_mask = get_keras_mask(y_pred)
 
         with keras.name_scope(self.name):
             y_pred = tree.map_structure(
@@ -51,7 +52,7 @@ class LossWithMultipleOutputs(keras.losses.Loss):
     
     def reduce(self, loss, sample_weight = None, in_mask = None):
         with keras.name_scope('reduction'):
-            out_mask = getattr(loss, "_keras_mask", None)
+            out_mask = get_keras_mask(loss)
 
             if in_mask is not None and out_mask is not None:
                 mask = in_mask & out_mask

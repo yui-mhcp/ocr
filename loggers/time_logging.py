@@ -13,6 +13,7 @@ import os
 import json
 import time
 import logging
+import itertools
 import threading
 import collections
 
@@ -27,6 +28,9 @@ TIME_LOGGER_NAME    = None
 _DISABLE_TIMERS = os.environ.get('LOGGERS_DISABLE_TIMERS', 'false').lower() in ('1', 'true')
 
 _str_indent     = '  '
+
+# see `add_timer_listener`
+_timer_listeners    = []
 
 class RootTimer:
     """
@@ -81,7 +85,7 @@ class RootTimer:
             This method is the only one required to be thread-safe as it (possibly creates) and returns the timers for a specific thread
             Once returned, the manipulation of these timers will be, by design, thread-safe as functions are executed in a single thread then will modify in a sequential order
         """
-        thread_id   = _get_thread_id()
+        thread_id   = _thread_id.value
         if thread_id not in self._timers:
             with self.mutex:
                 self._timers[thread_id]   = collections.OrderedDict()
@@ -150,6 +154,11 @@ class RootTimer:
 
         runnings.pop()
         timer['runs'].append(now - timer['start'])
+
+        if _timer_listeners:
+            # after the `pop` : `runnings` holds the parents of the stopped timer
+            path = tuple(t['name'] for t in runnings) + (name, )
+            _notify_listeners(path, timer['runs'][-1], self._thread_names.get(_get_thread_id(), None))
 
         return timer
     
@@ -262,6 +271,32 @@ def timer(name = None, *, debug = False, log_if_root = True, fn = None):
 def log_time(level = TIME_LEVEL):
     time_logger.log(level, str(_root_timer))
 
+def add_timer_listener(listener):
+    """
+        Registers `listener(path, duration, thread)`, called each time a tracked timer stops :
+        `path` is the `tuple` of the timer names from the root timer of its thread to the stopped
+        one, `duration` its execution time (seconds), `thread` the name of its thread.
+
+        This is the programmatic counterpart of the logged tree (e.g. a profiling notebook
+        collecting every run) : the logged tree aggregates the runs and is flushed by any root
+        timer of any thread, whereas a listener sees each run, as it ends. Only the timers that
+        are tracked (log level <= `TIME_LEVEL`, or `TIME_DEBUG_LEVEL` for the debug ones) are
+        notified. A listener must be fast and thread-safe : it runs in the thread of the timer
+    """
+    if listener not in _timer_listeners: _timer_listeners.append(listener)
+    return listener
+
+def remove_timer_listener(listener):
+    if listener in _timer_listeners: _timer_listeners.remove(listener)
+
+def _notify_listeners(path, duration, thread):
+    for listener in tuple(_timer_listeners):
+        try:
+            listener(path, duration, thread)
+        except Exception as e:
+            # a broken listener must not break the timed function
+            logger.warning('Timer listener {} failed : {}'.format(listener, e))
+
 def time_to_string(seconds):
     """ Returns a string representation of a time (given in seconds) """
     if seconds < 0.001: return '{} \u03BCs'.format(int(seconds * 1000000))
@@ -299,7 +334,18 @@ def _timer_to_str(timer, indent = 0, str_indent = _str_indent):
         des += '\n' + _timer_to_str(child_timer, indent = indent + 1, str_indent = str_indent)
     return des
 
-_get_thread_id  = threading.get_ident
+class _ThreadId(threading.local):
+    """ Unique id of the current thread : unlike `threading.get_ident`, it is never reused once a thread has finished """
+    def __init__(self):
+        # runs once per thread, at its first access (never on the hot path)
+        self.value = next(_thread_counter)
+
+_thread_counter = itertools.count()
+_thread_id      = _ThreadId()
+
+def _get_thread_id():
+    return _thread_id.value
+
 _main_thread_id = _get_thread_id()
 
 time_logger = logging.getLogger(TIME_LOGGER_NAME)

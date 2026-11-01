@@ -186,7 +186,14 @@ def group_blocks_in_lines(blocks, *, factor = 0.6, space_threshold = 0.35, ** _)
     else:
         groups, group, group_indexes = [([blocks[0]], boxes[:1])], [], []
     for i, block in enumerate(blocks[1:], start = 1):
-        if (group) and ('text' not in block or not any(_overlap_y(block['box'], g['box']) for g in group)):
+        if 'text' not in block:
+            # a non-text block (e.g. an image) is a line of its own
+            if group: groups.append((group, boxes[group_indexes]))
+            groups.append(([block], boxes[i : i + 1]))
+            group, group_indexes = [], []
+            continue
+
+        if (group) and not any(_overlap_y(block['box'], g['box']) for g in group):
             groups.append((group, boxes[group_indexes]))
             group, group_indexes = [], []
         
@@ -202,7 +209,7 @@ def group_blocks_in_lines(blocks, *, factor = 0.6, space_threshold = 0.35, ** _)
             lines.append(group[0])
             continue
         
-        # if 'text' not in blocks, the group is single-item and enters in the above condition
+        # a non-text block is a single-item group, which enters in the above condition
         is_text     = [any(c.isalnum() for c in block['text']) for block in group]
         text_boxes  = group_boxes[is_text]
         if len(text_boxes) == 0: text_boxes = group_boxes
@@ -283,9 +290,15 @@ def group_lines_in_paragraphs(lines, *, indent_threshold = 0.008, y_threshold = 
         groups, group, group_indexes = [([lines[0]], boxes[:1])], [], []
     
     for i, (line, is_close) in enumerate(zip(lines[1:], close_to_prev), start = 1):
+        if 'text' not in line:
+            # a non-text item (e.g. an image) is a paragraph of its own
+            if group: groups.append((group, boxes[group_indexes]))
+            groups.append(([line], boxes[i : i + 1]))
+            group, group_indexes = [], []
+            continue
+
         if (group) and (
-            'text' not in line
-            or abs(line['font_size'] - group[-1]['font_size']) > 1
+            abs(line['font_size'] - group[-1]['font_size']) > 1
             or line['box'][1] - group[-1]['box'][3] > (line['box'][3] - line['box'][1]) * y_threshold
             
         ):

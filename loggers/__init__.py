@@ -19,7 +19,9 @@ from functools import partial, partialmethod
 from .routing import (
     _styles, get_formatter, _nearest_config, LevelFilter, LevelRouter, LevelBasedFormatter
 )
-from .time_logging import TIME_LEVEL, TIME_DEBUG_LEVEL, Timer, timer, time_logger
+from .time_logging import (
+    TIME_LEVEL, TIME_DEBUG_LEVEL, Timer, timer, time_logger, add_timer_listener, remove_timer_listener
+)
 from .telegram_handler import TelegramHandler
 
 logger  = logging.getLogger(__name__)

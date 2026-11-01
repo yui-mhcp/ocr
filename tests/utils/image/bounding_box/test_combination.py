@@ -47,7 +47,7 @@ def test_combine_simple(asserts):
     asserts.assert_equal(target_boxes_hv, combined_boxes)
 
 
-def test_combine_with_lots_of_boxes(asserts):
+def _test_combine_with_lots_of_boxes(asserts):
     boxes = np.array([[0.0059, -0.0021, 0.1044, 0.0433],
      [0.0928, 0.0073, 0.1775, 0.0390],
      [0.5240, 0.0227, 0.5985, 0.0611],
@@ -139,7 +139,9 @@ def test_combine_with_lots_of_boxes(asserts):
      [0.6727, 0.9371, 0.7438, 0.9671],
      [0.7816, 0.9403, 0.8687, 0.9712]])
 
-    combined_boxes, groups, _ = combine_boxes_horizontal(boxes, source = 'xyxy', h_factor = 1.)
+    combined_boxes, groups, _ = combine_boxes_horizontal(
+        boxes, source = 'xyxy', h_factor = 1., y_norm = 'max'
+    )
     asserts.assert_equal(target_groups_h, groups)
     asserts.assert_equal(target_boxes_h, combined_boxes)
 

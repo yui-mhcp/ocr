@@ -39,6 +39,12 @@ def key(request):
     """ Primary-key arity : ``'single'`` (``str``) or ``'multi'`` (``tuple``). """
     return request.param
 
+@pytest.fixture
+def mutable(backend):
+    """ Skip the test for append-only backends (``update`` / ``pop`` / ``filter`` unsupported). """
+    if backend.append_only:
+        pytest.skip('backend `{}` is append-only'.format(backend.id))
+
 
 @pytest.fixture(autouse = True)
 def _isolate_db_cache():

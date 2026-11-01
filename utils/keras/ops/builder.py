@@ -169,7 +169,13 @@ class Ops:
     @cache
     def get_backend_function(keras_fn, backend):
         module, name = keras_fn.__module__.split('.')[-1], keras_fn.__name__
-        
-        return timer(fn = getattr(
-            importlib.import_module('keras.src.backend.{}.{}'.format(backend, module)), name
-        ), name = '{}_{}'.format(backend, name), debug = True)
+
+        # keras >= 3.16 moved the backend ops to `keras.src.backend.<backend>.ops.<module>`
+        try:
+            backend_module = importlib.import_module('keras.src.backend.{}.ops.{}'.format(backend, module))
+        except ModuleNotFoundError:
+            backend_module = importlib.import_module('keras.src.backend.{}.{}'.format(backend, module))
+
+        return timer(
+            fn = getattr(backend_module, name), name = '{}_{}'.format(backend, name), debug = True
+        )

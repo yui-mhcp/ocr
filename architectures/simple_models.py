@@ -265,18 +265,17 @@ def simple_cnn(input_shape  = None,
             output_layer = [Dense(
                 output_shape_i,
                 use_bias    = _get_var(hparams.final_bias, i),
-                activation  = _get_var(hparams.final_activation, i),
                 name        = '{}_{}'.format(hparams.final_name, i)
             ) for i, output_shape_i in enumerate(output_shape)]
         else:
             output_layer = Dense(
                 output_shape,
                 use_bias    = hparams.final_bias,
-                activation  = hparams.final_activation, 
                 name        = hparams.final_name
             )
         
-        outputs = add_layer(outputs, output_layer)
+        # the `final_activation` is applied by a dedicated layer below (it supports custom activations)
+        outputs = add_layer(x, output_layer)
         if hparams.final_activation:
             if isinstance(outputs, (list, tuple)):
                 outputs = [

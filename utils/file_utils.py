@@ -210,26 +210,36 @@ def load_data(filename, ** kwargs):
     
     return _load_file_fn[ext](filename, ** kwargs)
 
+def _decode_json(data):
+    """
+        Decodes `data` with `msgspec` (if available), and falls back to `json` for the non-standard
+        `NaN` / `Infinity` rejected by `msgspec` (e.g., files written by `json.dumps`)
+    """
+    if _use_msgspec:
+        try:
+            return msgspec.json.decode(data)
+        except msgspec.DecodeError:
+            pass
+    return json.loads(data)
+
 @load_data.dispatch
 def load_json(filename, default = {}, ** kwargs):
     """ Safely load data from a json file """
     if not os.path.exists(filename): return default
     with open(filename, 'r', encoding = 'utf-8') as file:
         result = file.read()
-    return json.loads(result) if not _use_msgspec else msgspec.json.decode(result)
+    return _decode_json(result)
 
 @load_data.dispatch
 def load_jsonl(filename, default = None, ** kwargs):
     """ Load a JSON-lines file, skipping any corrupt line (e.g. a partial trailing append). """
-    load_fn = msgspec.json.decode if _use_msgspec else json.loads
-
     events = []
     with open(filename, 'r', encoding = 'utf-8') as file:
         for line in file:
             line = line.strip()
             if not line: continue
             try:
-                events.append(load_fn(line))
+                events.append(_decode_json(line))
             except ValueError:  # json.JSONDecodeError & msgspec.DecodeError both subclass ValueError
                 logger.warning('Skipping corrupt jsonl line from {}: `{}`'.format(filename, line))
     return events

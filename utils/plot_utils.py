@@ -1068,6 +1068,8 @@ def _get_label_config(label, idx, config):
     else: return config
 
 def _normalize_colors(colors, cmap = None):
+    if isinstance(colors, dict):
+        return {k : v for k, v in zip(colors, _normalize_colors(list(colors.values()), cmap))}
     if not isinstance(colors, _iterable_types): return colors
     
     import matplotlib.pyplot as plt
@@ -1076,7 +1078,7 @@ def _normalize_colors(colors, cmap = None):
         isinstance(c, int) for c in colors):
         colors = np.array(list(colors))
         mapper = plt.cm.ScalarMappable(cmap = cmap)
-        colors = np.reshape(mapper.to_rgba(np.reshape(colors, [-1])), colors.shape + (4, ))
+        colors = np.reshape(mapper.to_rgba(np.reshape(colors, [-1])), colors.shape + (4, )).tolist()
     
     return colors
 

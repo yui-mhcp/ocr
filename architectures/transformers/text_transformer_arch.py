@@ -12,6 +12,7 @@
 import keras
 import logging
 import keras.ops as K
+from keras.src.backend.common.masking import set_keras_mask
 
 from functools import cached_property
 
@@ -247,7 +248,7 @@ class TransformerTokenEmbedding(keras.layers.Layer):
             embeddings = self.dropout(embeddings, training = training)
 
         if keras.backend.backend() != 'jax':
-            embeddings._keras_mask = mask
+            set_keras_mask(embeddings, mask)
         
         return embeddings
 

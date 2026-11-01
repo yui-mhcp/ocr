@@ -160,8 +160,25 @@ def get_flatten_layer(flatten_type, dim, use_cudnn = _use_cudnn_lstm, ** kwargs)
         if 'bi' in flatten_type:
             layer = layers.Bidirectional(layer)
         set_cudnn_lstm(layer, ** kwargs)
-        
+        enable_rnn_masking(layer)
+
         return layer
+
+def backend_rnn(step_function, inputs, initial_states, ** kwargs):
+    """ `keras.src.backend.rnn` is the `rnn` function in `keras 3.14`, but its module in `keras 3.16` """
+    module = importlib.import_module('keras.src.backend.{}.rnn'.format(keras.backend.backend()))
+    return module.rnn(step_function, inputs, initial_states, ** kwargs)
+
+def enable_rnn_masking(layer):
+    """
+        Propagates the input mask to the RNN outputs (disabled by default since `keras 3.16`)
+        `supports_masking` is not serialized : it has to be set each time the layer is created
+    """
+    layer.supports_masking = True
+    if isinstance(layer, layers.Bidirectional):
+        layer.forward_layer.supports_masking  = True
+        layer.backward_layer.supports_masking = True
+    return layer
 
 def set_cudnn_lstm(layer, use_cudnn = _use_cudnn_lstm, ** _):
     if isinstance(layer, keras.Model):

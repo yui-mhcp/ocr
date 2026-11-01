@@ -23,8 +23,12 @@ import pytest
 
 keras = pytest.importorskip('keras')
 
-from custom_train_objects.metrics import get_metrics, TextAccuracy, EER
-from ._helpers import normalize_object
+from custom_train_objects import metrics
+from custom_train_objects.metrics import get_metrics
+from ._helpers import normalize_object, optional_object, optional_param, requires
+
+# each sub-project only ships the metrics it uses
+TextAccuracy, EER = (optional_object(metrics, name) for name in ('TextAccuracy', 'EER'))
 
 pytestmark = pytest.mark.keras
 
@@ -32,13 +36,14 @@ pytestmark = pytest.mark.keras
 # --- registry round-trips ----------------------------------------------------------
 
 @pytest.mark.parametrize('name,metric', [
-    pytest.param('TextAccuracy', TextAccuracy(pad_value = 0, eos_value = -1), id = 'text_accuracy'),
-    pytest.param('EER', EER(), id = 'eer'),
+    optional_param('TextAccuracy', TextAccuracy, pad_value = 0, eos_value = -1, id = 'text_accuracy'),
+    optional_param('EER', EER, id = 'eer'),
 ])
 def test_metric_serialization_roundtrip(name, metric, asserts):
     rebuilt = get_metrics(keras.metrics.serialize(metric))
     asserts.assert_equal(normalize_object(metric), normalize_object(rebuilt))
 
+@requires(TextAccuracy, 'TextAccuracy')
 def test_text_accuracy_config_roundtrip(asserts):
     metric  = TextAccuracy(pad_value = 0, eos_value = 2)
     rebuilt = get_metrics('TextAccuracy', ** metric.get_config())
@@ -50,10 +55,12 @@ def test_text_accuracy_config_roundtrip(asserts):
 def test_get_metrics_accuracy_passthrough():
     assert get_metrics('accuracy') == 'accuracy'
 
+@requires(TextAccuracy, 'TextAccuracy')
 def test_get_metrics_instance_passthrough():
     metric = TextAccuracy()
     assert get_metrics(metric) is metric
 
+@requires(TextAccuracy, 'TextAccuracy')
 def test_get_metrics_list():
     metrics = get_metrics(['accuracy', TextAccuracy()])
     assert metrics[0] == 'accuracy'
@@ -62,12 +69,14 @@ def test_get_metrics_list():
 
 # --- TextAccuracy : padding mask ---------------------------------------------------
 
+@requires(TextAccuracy, 'TextAccuracy')
 def test_padding_mask_distinct_eos(asserts):
     # eos != pad -> pure `!= pad_value` mask
     metric  = TextAccuracy(pad_value = 0, eos_value = -1)
     mask    = metric.build_padding_mask(keras.ops.convert_to_tensor([[1, 2, 0, 0]], 'int32'))
     asserts.assert_equal(np.array([[True, True, False, False]]), np.asarray(mask))
 
+@requires(TextAccuracy, 'TextAccuracy')
 def test_padding_mask_eos_equals_pad(asserts):
     # eos == pad -> length is `#non-pad + 1` (one eos slot kept)
     metric  = TextAccuracy(pad_value = 0, eos_value = 0)
@@ -77,6 +86,7 @@ def test_padding_mask_eos_equals_pad(asserts):
 
 # --- TextAccuracy : accuracy / exact-match -----------------------------------------
 
+@requires(TextAccuracy, 'TextAccuracy')
 def test_text_accuracy_perfect_match(asserts):
     metric  = TextAccuracy(pad_value = 0, eos_value = -1)
     y_true  = keras.ops.convert_to_tensor([[1, 2, 0]], 'int32')
@@ -89,6 +99,7 @@ def test_text_accuracy_perfect_match(asserts):
     asserts.assert_equal(1.0, res['accuracy'])
     asserts.assert_equal(1.0, res['exact_match'])
 
+@requires(TextAccuracy, 'TextAccuracy')
 def test_text_accuracy_partial_match(asserts):
     metric  = TextAccuracy(pad_value = 0, eos_value = -1)
     y_true  = keras.ops.convert_to_tensor([[1, 2, 0]], 'int32')
@@ -104,6 +115,7 @@ def test_text_accuracy_partial_match(asserts):
 
 # --- EER ---------------------------------------------------------------------------
 
+@requires(EER, 'EER')
 def test_eer_perfect_separation(asserts):
     """ Perfectly separable scores -> EER ~ 0 and AUC ~ 1. """
     metric  = EER()

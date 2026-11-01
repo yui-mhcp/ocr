@@ -148,9 +148,12 @@ def parse_document(filename,
 
     if _cache is not None and filename in _cache:
         parsed_file = _cache[filename]['parsed_file']
-    else:
+    elif cache_dir:
         parsed_file = os.path.join(cache_dir, str(time.time()) + '.json')
-    image_folder = parsed_file[:-5] if extract_images else None
+    else:
+        # no cache (e.g. a document of an in-memory conversation) : nothing is written
+        parsed_file = None
+    image_folder = parsed_file[:-5] if extract_images and parsed_file else None
 
     try:
         paragraphs = parser(filename, image_folder = image_folder, ** kwargs)

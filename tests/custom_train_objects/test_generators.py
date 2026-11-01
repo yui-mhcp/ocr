@@ -28,7 +28,10 @@ import pytest
 keras = pytest.importorskip('keras')
 
 from utils.keras import TensorSpec
-from custom_train_objects.generators.ge2e_generator import GE2EGenerator
+# `GE2EGenerator` is only shipped by the projects that use it
+GE2EGenerator = pytest.importorskip(
+    'custom_train_objects.generators.ge2e_generator', exc_type = ModuleNotFoundError
+).GE2EGenerator
 
 pytestmark = pytest.mark.keras
 

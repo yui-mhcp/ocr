@@ -2,6 +2,25 @@
 
 This file tracks the major updates of the [ocr](https://github.com/yui-mhcp/ocr) project. For the global, cross-project overview of all the `yui-mhcp` repositories, see the [central CHANGELOG](https://github.com/yui-mhcp/yui-mhcp/blob/main/CHANGELOG.md) :smile:
 
+## [v1.1.0] - 01/11/2026 - November update ! :yum:
+
+Minor release, mainly synced with the shared foundation, with a new (experimental) region tracking for the streaming OCR !
+
+### Major updates
+
+- The shared `utils` / `loggers` / `models/core` foundation has been synced (see the [data_processing CHANGELOG](https://github.com/yui-mhcp/data_processing/blob/main/CHANGELOG.md) and the [base_dl_project CHANGELOG](https://github.com/yui-mhcp/base_dl_project/blob/main/CHANGELOG.md)) : new `image_augmentation` module, `Tokenizer` support of `transformers 5`, new `TensorRTLLMAPIRuntime` (TensorRT-LLM `LLM API`), new append-only `JSONLDatabase`, `keras 3.16` compatibility and an extended test suite
+
+### Minor updates
+
+- **[EXPERIMENTAL]** New `RegionTracker` (`models/ocr/region_tracker.py`) : a persistent spatial memory associating the text *slots* (positions) to their last OCR-ised *content*, enabled by `stream(track_regions = True)` (configured by `tracker_config`). It replaces the `RepetitionFilter`, the "already emitted" IoA filter and the emitted-texts sets, and only re-OCR-ises the regions whose content changed
+- The legacy streaming pipeline now applies the "already emitted" IoA filter first, keeps the edit-distance history across (possibly false) scene switches, and its default history size `k` has been increased (5 -> 15)
+- The line combination relies on the new `combine_line_continuations` / `sanitize_line_rows` methods
+- `keras 3.16` compatibility of the shared `architectures` : the RNN masking is explicitly re-enabled (`enable_rnn_masking`), `backend_rnn` resolves the moved `keras.src.backend.rnn` module, and the masks are handled through `get_keras_mask` / `set_keras_mask` instead of the private `_keras_mask` attribute
+
+### Bugs fixed
+
+- `pip install -e .` works again with the recent `setuptools` versions : the `License ::` classifier, superseded by the PEP 639 `license` expression (`AGPL-3.0-or-later`), has been removed from the `pyproject.toml`
+
 ## [v1.0.0] - 21/07/2026 - Major refactoring release ! :yum:
 
 First tagged release (`v1.0.0`) following a large refactoring of the OCR models on top of the restructured `BaseModel` foundation (see the [base_dl_project CHANGELOG](https://github.com/yui-mhcp/base_dl_project/blob/main/CHANGELOG.md)) and the shared `utils` / `loggers` socle (see the [data_processing CHANGELOG](https://github.com/yui-mhcp/data_processing/blob/main/CHANGELOG.md)) !

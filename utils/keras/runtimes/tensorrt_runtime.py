@@ -117,7 +117,7 @@ class TensorRTRuntime(Runtime):
 
         import torch
 
-        kwargs.update({name : arg for name, arg in zip(self.bindings, args)})
+        kwargs.update({name : arg for name, arg in zip(self.argnames, args)})
         
         if self.prepare is not None:
             with Timer('pre-processing'):
@@ -226,7 +226,11 @@ class TensorRTRuntime(Runtime):
         builder = trt.Builder(trt_logger)
         config  = builder.create_builder_config()
 
-        network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
+        if hasattr(trt.NetworkDefinitionCreationFlag, 'STRONGLY_TYPED'):
+            flag, _add_type = 1 << int(trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED), False
+        else:
+            flag, _add_type = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH), True
+        network = builder.create_network(flag)
         
 
         with trt.OnnxParser(network, trt_logger) as parser:
@@ -247,10 +251,11 @@ class TensorRTRuntime(Runtime):
             des += "\nOutput '{}' with shape {} and dtype {}".format(out.name, out.shape, out.dtype)
         logger.info(des)
         
-        if any(inp.dtype == trt.DataType.HALF for inp in inputs):
-            config.set_flag(trt.BuilderFlag.FP16)
-        elif any(inp.dtype == trt.DataType.BF16 for inp in inputs):
-            config.set_flag(trt.BuilderFlag.BF16)
+        if _add_type:
+            if any(inp.dtype == trt.DataType.HALF for inp in inputs):
+                config.set_flag(trt.BuilderFlag.FP16)
+            elif any(inp.dtype == trt.DataType.BF16 for inp in inputs):
+                config.set_flag(trt.BuilderFlag.BF16)
         
         if any(any(s == -1 for s in inp.shape) for inp in inputs):
             profile = builder.create_optimization_profile()

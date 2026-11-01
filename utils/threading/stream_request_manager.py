@@ -252,7 +252,7 @@ class ChildRequestManager(RequestManager):
         with self.mutex:
             return request_id in self._stopped
 
-    # `RequestController` (models.nlu.streaming) polls `is_aborted` between the pipeline
+    # `RequestController` (models.nlu.request_controller) polls `is_aborted` between the pipeline
     # steps (cf its docstring) : without this alias, a 'stop' action received during a long
     # pre-generation phase (prompt preparation, image encoding) would only be observed at
     # the first streaming step

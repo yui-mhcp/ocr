@@ -11,12 +11,16 @@
 
 import os
 import re
+import json
 import logging
 import warnings
 
 from functools import cache
+from itertools import repeat
 
 logger  = logging.getLogger(__name__)
+
+_inf    = float('inf')
 
 _eos_chars = (
     '\n\n',             # typical paragraph end
@@ -295,11 +299,26 @@ def split_and_join(text, pattern, * args):
         re.escape(p) if '\\' not in p else p for p in pattern
     ])), text)
 
+# the French words elided before a vowel or a mute h (« d'Alice », « qu'Alice »), and the letters that elide
+# them (`y` is a consonant in a name : « de Yasmine »)
+_ELISIONS   = {'de' : "d'", 'que' : "qu'"}
+_ELIDING    = frozenset('aeiouhàâäéèêëîïôöùûüœæ')
+
+def elide(name, word = 'de'):
+    """
+        `word` followed by `name`, elided in French before a vowel or a mute h : `elide('Alice')` ->
+        "d'Alice", `elide('Yasmine')` -> "de Yasmine", `elide('Alice', 'que')` -> "qu'Alice". Also the `elide` filter
+        of the jinja templates (`{{ agent | elide }}`, `{{ agent | elide('que') }}`)
+    """
+    if name and word in _ELISIONS and name[0].lower() in _ELIDING: return _ELISIONS[word] + name
+    return '{} {}'.format(word, name)
+
 def format_text(format, ** kwargs):
     """
         Apply `format` with `kwargs`:
         - if `format` is a python-like format, calls `format.format(** kwargs)`
         - if `format` is a `jinja` format, calls `jinja2.ImmutableSandboxedEnvironment.render(** kwargs)`
+          (with the `tojson` / `elide` filters, see `compile_jinja_template`)
         - Otherwise, return `format`
     """
     if '{' not in format:
@@ -321,10 +340,23 @@ def compile_jinja_template(template):
     def raise_exception(message):
         raise TemplateError(message)
 
-    env = ImmutableSandboxedEnvironment(trim_blocks = True, lstrip_blocks = True)
+    # the `transformers` environment : `loopcontrols` (`break` / `continue`), and its own `tojson`
+    # (the jinja builtin sorts the keys and escapes the accents and `<` / `>` / `&` / `'`, so a
+    # tools schema or a tool call would not be rendered as the model was trained on)
+    env = ImmutableSandboxedEnvironment(
+        trim_blocks = True, lstrip_blocks = True, extensions = ['jinja2.ext.loopcontrols']
+    )
     env.globals['raise_exception'] = raise_exception
     env.globals['basename'] = os.path.basename
+    env.filters['tojson'] = _tojson
+    env.filters['elide']  = elide
     return env.from_string(template)
+
+def _tojson(value, ensure_ascii = False, indent = None, separators = None, sort_keys = False):
+    """ The `tojson` filter of the `transformers` chat templates (plain `json.dumps`) """
+    return json.dumps(
+        value, ensure_ascii = ensure_ascii, indent = indent, separators = separators, sort_keys = sort_keys
+    )
 
 
 def get_pairs(text, n = 2):
@@ -332,41 +364,42 @@ def get_pairs(text, n = 2):
     return [tuple(text[i : i + n]) for i in range(0, len(text) - n + 1)]
 
 def bpe(token, bpe_ranks, end_of_word = None):
-    """ Computes the byte-pair-encoding (BPE) algorithm """
-    word    = tuple(token) if end_of_word is None else tuple(token[:-1]) + (token[-1] + end_of_word, )
-    pairs   = get_pairs(word)
+    """
+        Computes the byte-pair-encoding (BPE) algorithm
 
-    if not pairs:
-        if not end_of_word: end_of_word = ''
-        return token + end_of_word
-    
-    while True:
-        bigram = min(pairs, key = lambda pair: bpe_ranks.get(pair, float('inf')))
-        if bigram not in bpe_ranks: break
-        
-        first, second = bigram
-        new_word = []
-        i = 0
-        while i < len(word):
-            try:
-                j = word.index(first, i)
-                new_word.extend(word[i:j])
-                i = j
-            except ValueError:
-                new_word.extend(word[i:])
-                break
-            
-            if word[i] == first and i < len(word) - 1 and word[i + 1] == second:
-                new_word.append(first + second)
+        Arguments :
+            - token     : the word to split (`str`)
+            - bpe_ranks : `dict` `{(first, second) : rank}`, the lower the rank, the earlier the merge
+            - end_of_word   : special suffix added to the last symbol (e.g., `</w>` for CLIP)
+        Return :
+            - symbols   : `tuple` of sub-words (always a `tuple`, even for a single symbol)
+
+        At each step, the pair with the lowest rank is merged (all its non-overlapping occurrences, from left to right). The ranks of all adjacent pairs are computed in a single (C-level) `map`, which avoids the `min(..., key = lambda)` and `get_pairs` re-allocation of the reference implementation.
+    """
+    word = list(token)
+    if end_of_word and word: word[-1] += end_of_word
+
+    get = bpe_ranks.get
+    while len(word) > 1:
+        ranks   = list(map(get, zip(word, word[1:]), repeat(_inf)))
+        best    = min(ranks)
+        if best == _inf: break
+
+        i = ranks.index(best)
+        first, second   = word[i], word[i + 1]
+        merged  = first + second
+
+        new_word, last = word[: i], len(word) - 1
+        while i <= last:
+            if i < last and word[i] == first and word[i + 1] == second:
+                new_word.append(merged)
                 i += 2
             else:
                 new_word.append(word[i])
                 i += 1
-        new_word = tuple(new_word)
         word = new_word
-        if len(word) == 1: break
-        else: pairs = get_pairs(word)
-    return word
+
+    return tuple(word)
 
 def bytes_to_unicode():
     bs = (

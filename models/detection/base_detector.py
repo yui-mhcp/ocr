@@ -29,8 +29,9 @@ class BaseDetector(ClassificationModelMixin, ImageModelMixin, BaseModel):
     input_signature = ImageModelMixin.image_signature
 
     prepare_input   = ImageModelMixin.get_image
+    augment_input   = ImageModelMixin.augment_image
     process_input   = ImageModelMixin.process_image
-    
+
     def decode_output(self, model_output, ** kwargs):   raise NotImplementedError()
     def prepare_output(self, data, ** kwargs):          raise NotImplementedError()
     

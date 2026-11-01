@@ -14,9 +14,13 @@ import numpy as np
 from functools import cached_property
 
 from utils import is_dataframe
-from utils.image import load_image, get_image_normalization_fn
+from utils.image import load_image, get_image_normalization_fn, augment_image as apply_augmentation
 from utils.keras import TensorSpec, ops
 from ..utils import infer_downsampling_factor, infer_upsampling_factor
+
+# box-safe (pixel-only) transformations : `hue` / `saturation` require RGB images
+_RGB_AUGMENT_METHODS    = ('noise', 'brightness', 'contrast', 'hue', 'saturation')
+_GRAY_AUGMENT_METHODS   = ('noise', 'brightness', 'contrast')
 
 class ImageModelMixin:
     def _init_image(self,
@@ -83,7 +87,19 @@ class ImageModelMixin:
     @property
     def image_signature(self):
         return TensorSpec(shape = (None, ) + self.input_size, dtype = self.image_dtype)
-    
+
+    @property
+    def default_augment_methods(self):
+        return list(_GRAY_AUGMENT_METHODS if self.color_mode == 'gray' else _RGB_AUGMENT_METHODS)
+
+    @property
+    def training_hparams(self):
+        """ Adds the `augment_methods` used by `augment_image` next to the `augment_prct` hparam """
+        hparams = super().training_hparams
+        if 'augment_prct' in hparams:
+            hparams = {** hparams, 'augment_methods' : self.default_augment_methods}
+        return hparams
+
     def _str_image(self):
         des = "- Image size : {}\n".format(self.input_size)
         if self.resize_kwargs: des += "- Resize config : {}\n".format(self.resize_kwargs)
@@ -129,7 +145,20 @@ class ImageModelMixin:
         return self.image_normalization_fn(image) if self.image_normalization_fn else image
 
     process_image = normalize_image
-    
+
+    def augment_image(self, image, ** kwargs):
+        """
+            Applies each of `self.augment_methods` on `image` with `self.augment_prct` probability
+            (both set by `fit` from `training_hparams`, no augmentation outside of it)
+
+            Note : augmentation runs after `process_image`, and the methods expect [0, 1] images
+        """
+        prct    = getattr(self, 'augment_prct', 0.)
+        methods = getattr(self, 'augment_methods', None)
+        if not prct or not methods: return image
+
+        return apply_augmentation(image, methods, prct = prct, ** kwargs)
+
     def prepare_image(self, image, ** kwargs):
         """ Load and normalize image """
         if isinstance(image, list):

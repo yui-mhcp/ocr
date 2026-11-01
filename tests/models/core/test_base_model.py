@@ -191,6 +191,16 @@ def test_normalize_prediction_inputs(inputs, expected):
     m = DummyModel(name = 'norm', save = False)
     assert m._normalize_prediction_inputs(inputs) == expected
 
+def test_normalize_prediction_inputs_dataframe_as_records():
+    # `Stream` would otherwise iterate the rows as `pd.Series`, not as the expected `dict`
+    pd = pytest.importorskip('pandas')
+
+    m = DummyModel(name = 'norm', save = False)
+    df = pd.DataFrame([{'filename' : 'a.jpg', 'label' : 'x'}, {'filename' : 'b.jpg', 'label' : 'y'}])
+    assert m._normalize_prediction_inputs(df) == [
+        {'filename' : 'a.jpg', 'label' : 'x'}, {'filename' : 'b.jpg', 'label' : 'y'}
+    ]
+
 
 class _FilterModel(DummyModel):
     def filter_prediction_output(self, output):

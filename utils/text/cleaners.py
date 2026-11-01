@@ -11,6 +11,7 @@
 
 import os
 import re
+import regex
 import unicodedata
 
 from functools import partial
@@ -37,6 +38,13 @@ _whitespace_re = re.compile(r'\s+')
 _url_re     = re.compile(r'[a-z]+://[\S\n]+')
 _file_re    = re.compile(r'\S+\.(?:pdf|docx|txt|md|html)\b')
 _acronym_re     = re.compile(r"[A-Z]{2,5}\b")
+# Unicode punctuation + all ASCII symbols, as defined in `BertPreTokenizer` (`tokenizers`)
+_all_punctuation_re = regex.compile(r'([\p{P}!-/:-@\[-`{-~])')
+# CJK ideographs, as defined in `BertNormalizer` (`tokenizers`)
+_cjk_re         = re.compile(
+    '([一-鿿㐀-䶿\U00020000-\U0002A6DF\U0002A700-\U0002B73F'
+    '\U0002B740-\U0002B81F\U0002B820-\U0002CEAF豈-﫿\U0002F800-\U0002FA1F])'
+)
 _punctuation    = '_!?.,’“”‚‘—–()[]{}:;\'"`+-*/^=\\<>&#$%@¿′″·§~'
 _left_punctuation   = '([{'
 _right_punctuation  = ')]},.'
@@ -230,6 +238,10 @@ def detach_punctuation(text, punctuation = _punctuation, ** kwargs):
         text = text.replace(punct, ' {} '.format(punct))
     return text.strip()
 
+def split_punctuation(text, ** kwargs):
+    """ Surrounds each punctuation character (Unicode `P*` + ASCII symbols) with spaces (as `BertPreTokenizer`) """
+    return _all_punctuation_re.sub(r' \1 ', text)
+
 def remove_punctuation(text, punctuation = _punctuation, ** kwargs):
     return ''.join(c for c in text if c not in punctuation)
 
@@ -254,6 +266,14 @@ def remove_control(text, ** kwargs):
         c for c in text if c in ('\t', '\n', '\r', ' ') or c.isalnum()
         or not unicodedata.category(c).startswith('C')
     ])
+
+def normalize_unicode(text, form = 'NFC', ** kwargs):
+    """ Unicode normalization (e.g., `NFC` for Qwen tokenizers) """
+    return unicodedata.normalize(form, text)
+
+def pad_cjk(text, ** kwargs):
+    """ Surrounds CJK ideographs with spaces (as `BertNormalizer(handle_chinese_chars = True)`) """
+    return re.sub(_cjk_re, r' \1 ', text)
 
 def remove_accents(text, ** kwargs):
     text = unicodedata.normalize("NFD", text)

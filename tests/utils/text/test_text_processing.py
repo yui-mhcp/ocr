@@ -27,7 +27,7 @@ needs ``jinja2`` and is skipped if it is missing.
 import pytest
 
 from utils.text.text_processing import (
-    split_sentences, merge_texts, split_text, split_and_join, get_pairs, bpe, format_text,
+    split_sentences, merge_texts, split_text, split_and_join, get_pairs, bpe, format_text, elide
 )
 
 _words = lambda text: text.split()
@@ -132,7 +132,21 @@ def test_bpe_merges_ranked_pair(asserts):
     asserts.assert_equal(('h', 'e', 'll', 'o'), bpe('hello', {('l', 'l') : 0}))
 
 def test_bpe_single_char(asserts):
-    asserts.assert_equal('a', bpe('a', {}))
+    # always a `tuple` : a `str` result was extended character by character by `Tokenizer.tokenize`
+    asserts.assert_equal(('a', ), bpe('a', {}))
+
+def test_bpe_end_of_word(asserts):
+    """ Regression : a single-character word with an end-of-word suffix (CLIP) must stay one symbol. """
+    asserts.assert_equal(('a</w>', ), bpe('a', {}, end_of_word = '</w>'))
+    asserts.assert_equal(('h', 'ell', 'o</w>'), bpe(
+        'hello', {('l', 'l') : 0, ('e', 'll') : 1}, end_of_word = '</w>'
+    ))
+
+def test_bpe_merges_all_occurrences(asserts):
+    """ The best pair is merged at all its (non-overlapping) positions, left to right. """
+    asserts.assert_equal(('aa', 'a'), bpe('aaa', {('a', 'a') : 0}))
+    asserts.assert_equal(('ab', 'ab'), bpe('abab', {('a', 'b') : 0, ('b', 'a') : 1}))
+    asserts.assert_equal(('abab', ), bpe('abab', {('a', 'b') : 0, ('ab', 'ab') : 1}))
 
 @pytest.mark.parametrize('fmt,kwargs,expected', [
     ('Hello {name}', {'name' : 'World'}, 'Hello World'),
@@ -145,3 +159,17 @@ def test_format_text(asserts, fmt, kwargs, expected):
 def test_format_text_jinja(asserts):
     pytest.importorskip('jinja2')
     asserts.assert_equal('World', format_text('{{ name }}', name = 'World'))
+
+@pytest.mark.parametrize('name,word,expected', [
+    ('Alice', 'de', "d'Alice"), ('Yasmine', 'de', 'de Yasmine'), ('Max', 'de', 'de Max'),
+    ('Émilie', 'de', "d'Émilie"), ('Hugo', 'de', "d'Hugo"), ('Alice', 'que', "qu'Alice"), ('Yasmine', 'que', 'que Yasmine'),
+    ('Alice', 'à', 'à Alice')
+])
+def test_elide(asserts, name, word, expected):
+    asserts.assert_equal(expected, elide(name, word))
+
+def test_format_text_elide_filter(asserts):
+    pytest.importorskip('jinja2')
+    asserts.assert_equal(
+        "l'identité d'Alice, afin qu'Alice", format_text("l'identité {{ a | elide }}, afin {{ a | elide('que') }}", a = 'Alice')
+    )

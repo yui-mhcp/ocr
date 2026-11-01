@@ -16,6 +16,7 @@ import collections
 import keras.ops as K
 
 from keras import tree
+from keras.src.backend.common.masking import get_keras_mask, set_keras_mask
 from functools import cached_property
 
 from loggers import timer
@@ -85,10 +86,7 @@ HParamsTransformerDecoder   = HParamsTransformerBlock(
 
 def set_mask(t, mask):
     if keras.backend.backend() == 'jax': return t
-    try:
-        t._keras_mask = mask
-    except AttributeError:
-        pass
+    set_keras_mask(t, mask)
     return t
 
 def _get_state_length(state):
@@ -665,7 +663,7 @@ class TransformerBlock(keras.Model):
                 mask    = mask,
                 ** kwargs
             )
-            if hasattr(output, '_keras_mask'):  padding_mask = output._keras_mask
+            if get_keras_mask(output) is not None: padding_mask = get_keras_mask(output)
 
         mask = self[0].compute_mask(
             inputs,

@@ -11,6 +11,7 @@
 
 import keras
 import keras.ops as K
+from keras.src.backend.common.masking import set_keras_mask
 
 def _compute_new_len(seq_len, kernel_size, strides, padding, dilation_rate):
     if padding != 'same': seq_len = seq_len - kernel_size + 1
@@ -40,10 +41,7 @@ class MaskedMaxPooling1D(keras.layers.MaxPooling1D):
         if mask is not None:
             mask = self.compute_mask(out, mask)
             out  = out * K.cast(mask, out.dtype)[:, :, None]
-            try:
-                out._keras_mask = mask
-            except AttributeError:
-                pass
+            set_keras_mask(out, mask)
         
         return out
 
@@ -58,10 +56,7 @@ class MaskedAveragePooling1D(keras.layers.AveragePooling1D):
         if mask is not None:
             mask = self.compute_mask(out, mask)
             out  = out * K.cast(mask, out.dtype)[:, :, None]
-            try:
-                out._keras_mask = mask
-            except AttributeError:
-                pass
+            set_keras_mask(out, mask)
         
         return out
 
@@ -105,9 +100,6 @@ class MaskedConv1D(keras.layers.Conv1D):
             mask = self.compute_mask(out, mask, use_cached = False)
             out  = out * K.cast(mask[:, :, None], out.dtype)
             self._cached_mask = mask
-            try:
-                out._keras_mask = mask
-            except AttributeError:
-                pass
+            set_keras_mask(out, mask)
         
         return out
